@@ -90,9 +90,25 @@ function renderTriggerStatus(status, button) {
   return false;
 }
 
+// Trigger requests: bounded wait + a hint for Chrome's local-network permission.
+// On the owner's own machine the trigger host resolves to a private Tailscale
+// address, so Chrome holds the request until "Allow" is clicked in the address bar.
+const LNA_HINT = "Waiting for the browser — if Chrome asks to allow access to your local network, click Allow";
+async function triggerFetch(url, options = {}, { timeoutMs = 15000, hint = false } = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const hintTimer = hint ? setTimeout(() => showRefreshProgress(LNA_HINT), 2500) : null;
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+    if (hintTimer) clearTimeout(hintTimer);
+  }
+}
+
 async function pollTriggerStatus(config, button, showNetworkError = true) {
   try {
-    const response = await fetch(`${config.url}/status`, { cache: "no-store", referrerPolicy: "no-referrer" });
+    const response = await triggerFetch(`${config.url}/status`, { cache: "no-store", referrerPolicy: "no-referrer" }, { timeoutMs: 12000 });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const status = await readTriggerResponse(response);
     if (renderTriggerStatus(status, button)) {
@@ -106,7 +122,7 @@ async function pollTriggerStatus(config, button, showNetworkError = true) {
     stopRefreshPolling();
     if (showNetworkError) {
       showRefreshProgress(
-        "refresh service unreachable — the Mac may be asleep or Funnel not enabled",
+        "no answer from the refresh service — if Chrome showed a local-network permission prompt, click Allow and press again; otherwise the Mac may be asleep or Funnel off",
         "negative",
       );
     }
@@ -149,11 +165,11 @@ function initRefresh() {
     button.disabled = true;
     showRefreshProgress("Refreshing · starting");
     try {
-      const response = await fetch(`${config.url}/refresh`, {
+      const response = await triggerFetch(`${config.url}/refresh`, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
         body: "{}", cache: "no-store", referrerPolicy: "no-referrer",
-      });
+      }, { timeoutMs: 20000, hint: true });
       const payload = await readTriggerResponse(response);
       if (response.status === 401) {
         button.disabled = false;
@@ -173,7 +189,7 @@ function initRefresh() {
     } catch {
       button.disabled = false;
       showRefreshProgress(
-        "refresh service unreachable — the Mac may be asleep or Funnel not enabled",
+        "no answer from the refresh service — if Chrome showed a local-network permission prompt, click Allow and press again; otherwise the Mac may be asleep or Funnel off",
         "negative",
       );
     }
