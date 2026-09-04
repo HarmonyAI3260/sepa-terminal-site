@@ -21,6 +21,7 @@ function siteUrl(path) {
 }
 
 const REFRESH_KEY = "sepa_refresh_key";
+const REFRESH_OWNER = "sepa_refresh_owner";
 let refreshPollTimer = null;
 
 function readRefreshConfig() {
@@ -130,71 +131,17 @@ async function pollTriggerStatus(config, button, showNetworkError = true) {
 }
 
 function initRefresh() {
-  const config = readRefreshConfig();
-  const button = $("refresh-now");
-  if (!config.url || !button) return;
-  const keyInput = $("refresh-key");
-  // The site is shared by link: visitors never see the owner's refresh controls.
-  // They appear when a key is already stored here, or when the page is opened at #refresh.
-  let storedKey = "";
-  try { storedKey = localStorage.getItem(REFRESH_KEY) || ""; } catch {}
-  const ownerView = Boolean(config.token || storedKey) || window.location.hash === "#refresh";
-  if (!ownerView) {
-    const control = button.closest(".refresh-control");
-    if (control) control.hidden = true;
-    const progress = $("refresh-progress");
-    if (progress) progress.hidden = true;
-    return;
-  }
-  if (keyInput) {
-    try { keyInput.value = localStorage.getItem(REFRESH_KEY) || ""; } catch {}
-    keyInput.addEventListener("change", () => {
-      try { localStorage.setItem(REFRESH_KEY, keyInput.value); } catch {}
-    });
-  }
-  button.addEventListener("click", async () => {
-    const token = config.token || keyInput?.value || "";
-    if (!token) {
-      showRefreshProgress("Enter the refresh key", "negative");
-      keyInput?.focus();
-      return;
-    }
-    if (keyInput) {
-      try { localStorage.setItem(REFRESH_KEY, token); } catch {}
-    }
-    button.disabled = true;
-    showRefreshProgress("Refreshing · starting");
-    try {
-      const response = await triggerFetch(`${config.url}/refresh`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: "{}", cache: "no-store", referrerPolicy: "no-referrer",
-      }, { timeoutMs: 20000, hint: true });
-      const payload = await readTriggerResponse(response);
-      if (response.status === 401) {
-        button.disabled = false;
-        showRefreshProgress("refresh key rejected", "negative");
-        keyInput?.focus();
-        keyInput?.select();
-        return;
-      }
-      if (response.status === 429) {
-        button.disabled = false;
-        const minutes = Math.max(1, Math.ceil(Number(payload.retry_after || 0) / 60));
-        showRefreshProgress(`Refresh cooldown · try again in ${minutes} min`, "negative");
-        return;
-      }
-      if (![202, 409].includes(response.status)) throw new Error(`HTTP ${response.status}`);
-      await pollTriggerStatus(config, button, true);
-    } catch {
-      button.disabled = false;
-      showRefreshProgress(
-        "no answer from the refresh service — if Chrome showed a local-network permission prompt, click Allow and press again; otherwise the Mac may be asleep or Funnel off",
-        "negative",
-      );
-    }
-  });
-  pollTriggerStatus(config, button, false);
+  // The refresh console lives on the trigger's origin; the site only links to it.
+  // Visitors don't see the link: it appears when the page is opened at #refresh
+  // (remembered in this browser) so a shared link stays clean.
+  const control = $("refresh-control");
+  if (!control) return;
+  let owner = false;
+  try {
+    if (window.location.hash === "#refresh") localStorage.setItem(REFRESH_OWNER, "1");
+    owner = localStorage.getItem(REFRESH_OWNER) === "1";
+  } catch {}
+  control.hidden = !owner;
 }
 
 const FILTER_DEFAULTS = {
