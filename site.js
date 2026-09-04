@@ -20,115 +20,7 @@ function siteUrl(path) {
   return `${basePath}${path}`;
 }
 
-const REFRESH_KEY = "sepa_refresh_key";
 const REFRESH_OWNER = "sepa_refresh_owner";
-let refreshPollTimer = null;
-
-function readRefreshConfig() {
-  try {
-    const config = JSON.parse($("refresh-config")?.textContent || "{}");
-    return config && typeof config === "object" ? config : {};
-  } catch {
-    return {};
-  }
-}
-
-function showRefreshProgress(message, tone = "") {
-  const progress = $("refresh-progress");
-  if (!progress) return;
-  progress.hidden = false;
-  progress.className = `refresh-progress ${tone}`.trim();
-  progress.textContent = message;
-}
-
-function refreshClock(value) {
-  const stamp = new Date(value || Date.now());
-  if (Number.isNaN(stamp.getTime())) return "now";
-  return stamp.toLocaleTimeString("en-IN", {
-    hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "Asia/Kolkata",
-  });
-}
-
-function runningRefreshText(status) {
-  const phase = String(status.phase || "starting");
-  const detail = String(status.detail || "").trim();
-  if (phase === "scan") {
-    const scanDetail = detail.replace(/^scan(?:ning)?\s*[:·-]?\s*/i, "");
-    return `Refreshing · scan${scanDetail ? ` ${scanDetail}` : ""}`;
-  }
-  if (phase === "autogen") return "Refreshing · generating briefs";
-  if (phase === "build") return "Refreshing · building";
-  if (phase === "publish") return "Refreshing · publishing";
-  return `Refreshing · ${detail || "starting"}`;
-}
-
-async function readTriggerResponse(response) {
-  try { return await response.json(); } catch { return {}; }
-}
-
-function stopRefreshPolling() {
-  if (refreshPollTimer !== null) window.clearTimeout(refreshPollTimer);
-  refreshPollTimer = null;
-}
-
-function renderTriggerStatus(status, button) {
-  if (status.state === "running") {
-    button.disabled = true;
-    showRefreshProgress(runningRefreshText(status));
-    return true;
-  }
-  button.disabled = false;
-  stopRefreshPolling();
-  if (status.state === "done") {
-    const published = status.last_result?.published === true;
-    showRefreshProgress(
-      `${published ? "Published" : "Refresh complete"} ${refreshClock(status.finished_at)} — reload for the new snapshot`,
-      "positive",
-    );
-  } else if (status.state === "failed") {
-    showRefreshProgress(`Refresh failed · ${status.detail || "check the Mac trigger log"}`, "negative");
-  }
-  return false;
-}
-
-// Trigger requests: bounded wait + a hint for Chrome's local-network permission.
-// On the owner's own machine the trigger host resolves to a private Tailscale
-// address, so Chrome holds the request until "Allow" is clicked in the address bar.
-const LNA_HINT = "Waiting for the browser — if Chrome asks to allow access to your local network, click Allow";
-async function triggerFetch(url, options = {}, { timeoutMs = 15000, hint = false } = {}) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  const hintTimer = hint ? setTimeout(() => showRefreshProgress(LNA_HINT), 2500) : null;
-  try {
-    return await fetch(url, { ...options, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-    if (hintTimer) clearTimeout(hintTimer);
-  }
-}
-
-async function pollTriggerStatus(config, button, showNetworkError = true) {
-  try {
-    const response = await triggerFetch(`${config.url}/status`, { cache: "no-store", referrerPolicy: "no-referrer" }, { timeoutMs: 12000 });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const status = await readTriggerResponse(response);
-    if (renderTriggerStatus(status, button)) {
-      stopRefreshPolling();
-      refreshPollTimer = window.setTimeout(
-        () => pollTriggerStatus(config, button, true), 5000,
-      );
-    }
-  } catch {
-    button.disabled = false;
-    stopRefreshPolling();
-    if (showNetworkError) {
-      showRefreshProgress(
-        "no answer from the refresh service — if Chrome showed a local-network permission prompt, click Allow and press again; otherwise the Mac may be asleep or Funnel off",
-        "negative",
-      );
-    }
-  }
-}
 
 function initRefresh() {
   // The refresh console lives on the trigger's origin; the site only links to it.
@@ -158,6 +50,9 @@ const SEPA_LABELS = {
 };
 let scanData = null;
 let visibleRows = [];
+const PAGE_SIZE = 100;
+let scanPage = 0;
+let scanLoadPromise = null;
 let turnoverWasSaved = false;
 let filters = loadFilters();
 
@@ -205,7 +100,8 @@ function presetMatches(row, name) {
     && base.proper_vcp === true
     && (base.status !== "breakout" || base.breakout_confirmed === true && age <= 5);
   if (name === "fresh") return commonPlaybookGate(row) && tt >= 7 && row.rs >= 70
-    && base.proper_vcp === true && base.breakout_confirmed === true && age <= 5;
+    && base.status === "breakout" && base.pivot_lost !== true
+    && base.proper_vcp === true && base.breakout_confirmed === true && age >= 0 && age <= 5;
   if (name === "power") return commonPlaybookGate(row) && row.power_play?.flag === true;
   if (name === "earnings") return commonPlaybookGate(row);
   return true;
@@ -253,6 +149,7 @@ function renderFilterControls() {
 }
 
 function applyPreset(name) {
+  turnoverWasSaved = name !== "reset" || scanData !== null;
   const reset = {
     ...FILTER_DEFAULTS,
     stages: [...FILTER_DEFAULTS.stages],
@@ -346,7 +243,8 @@ function filteredRows() {
       && presetMatches(row, filters.activePreset)
       && (!filters.inBase || row.base?.in_base === true)
       && statusOk && setupOk && fundOk
-      && (!filters.recentBreakout || row.recent_breakout === true)
+      && (!filters.recentBreakout || row.recent_breakout === true
+        && row.base?.status === "breakout" && row.base?.pivot_lost !== true && row.stale !== true)
       && (!filters.powerPlay || row.power_play?.flag === true)
       && (filters.minBoVol === null || row.base?.breakout_vol_ratio >= filters.minBoVol)
       && (!filters.isNew || row.new_since_prev === true)
@@ -417,13 +315,24 @@ function pivotDisplay(base) {
   return { className: "", text: "–" };
 }
 
-function renderRows() {
+function renderRows(resetPage = true) {
+  if (!scanData) { loadScreener(); return; }
   visibleRows = filteredRows();
+  if (resetPage) scanPage = 0;
+  const pages = Math.max(1, Math.ceil(visibleRows.length / PAGE_SIZE));
+  scanPage = Math.max(0, Math.min(scanPage, pages - 1));
+  const first = scanPage * PAGE_SIZE;
+  const pageRows = visibleRows.slice(first, first + PAGE_SIZE);
+  $("scan-page-status").textContent = visibleRows.length
+    ? `Rows ${first + 1}–${first + pageRows.length} of ${visibleRows.length} · page ${scanPage + 1}/${pages}`
+    : "0 matching rows";
+  $("scan-prev").disabled = scanPage === 0;
+  $("scan-next").disabled = scanPage >= pages - 1;
   const meta = scanData.meta || {};
   const eight = (scanData.rows || []).filter((row) => row.tt?.passed === 8).length;
   const ready = (scanData.rows || []).filter((row) => row.sepa?.ready === true).length;
   $("scan-count").textContent = `Universe ${fmt(meta.universe_total, 0)} · scanned ${fmt(meta.scanned, 0)} · 8/8: ${fmt(eight, 0)} · ready: ${fmt(ready, 0)} · shown: ${fmt(visibleRows.length, 0)}`;
-  $("scan-results-body").innerHTML = visibleRows.map((row) => {
+  $("scan-results-body").innerHTML = pageRows.map((row) => {
     const base = row.base || {};
     const dots = (row.tt?.checks || []).map((check) => {
       const state = check.pass === true ? "pass" : check.pass === false ? "fail" : "unknown";
@@ -490,6 +399,8 @@ function exportCsv() {
 }
 
 function bindScreener() {
+  $("scan-prev").addEventListener("click", () => { scanPage -= 1; renderRows(false); });
+  $("scan-next").addEventListener("click", () => { scanPage += 1; renderRows(false); });
   document.querySelectorAll(".playbook-presets button[data-preset]").forEach((button) =>
     button.addEventListener("click", () => applyPreset(button.dataset.preset)));
   document.querySelectorAll("#scan-tier button[data-tier]").forEach((button) =>
@@ -504,6 +415,7 @@ function bindScreener() {
   [["scan-rs", "rs"], ["scan-turnover", "turnover"], ["scan-sales-yoy", "salesYoy"], ["scan-pat-yoy", "patYoy"]].forEach(([id, key]) =>
     $(id).addEventListener("input", (event) => {
       filters[key] = event.target.value === "" ? null : Number(event.target.value);
+      if (key === "turnover") turnoverWasSaved = true;
       filters.activePreset = null; saveFilters(); renderRows();
     }));
   [["scan-in-base", "inBase"], ["scan-near-pivot", "nearPivot"], ["scan-breakout", "breakout"],
@@ -523,29 +435,58 @@ function bindScreener() {
   $("scan-export-csv").addEventListener("click", exportCsv);
 }
 
-async function initScreener() {
+function loadScreener() {
+  if (scanData) return Promise.resolve();
+  if (scanLoadPromise) return scanLoadPromise;
+  $("scan-load").disabled = true;
+  $("scan-count").textContent = "Loading screener…";
+  scanLoadPromise = (async () => {
+    try {
+      const response = await fetch(siteUrl("/data/screener.json"), { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      if (!Array.isArray(data?.rows)) throw new Error("Snapshot has no row list");
+      scanData = data;
+      if (!turnoverWasSaved) {
+        filters.turnover = scanData.meta?.params?.turnover_gate_cr ?? null;
+        turnoverWasSaved = true;
+        saveFilters();
+      }
+      $("scan-load").hidden = true;
+      renderFilterControls();
+      renderRows();
+    } catch (error) {
+      scanData = null;
+      visibleRows = [];
+      $("scan-count").textContent = "Screener data unavailable";
+      $("scan-results-body").innerHTML = `<tr><td colspan="14" class="scan-no-results negative"><b>Could not load screener data.</b><span>${esc(error.message)}</span></td></tr>`;
+      $("scan-load").hidden = false;
+      $("scan-load").disabled = false;
+      $("scan-load").textContent = "Retry loading screener";
+    } finally {
+      scanLoadPromise = null;
+    }
+  })();
+  return scanLoadPromise;
+}
+
+function initScreener() {
   bindScreener();
-  try {
-    const response = await fetch(siteUrl("/data/screener.json"), { cache: "no-store" });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    scanData = await response.json();
-  } catch (error) {
-    $("scan-count").textContent = "Screener data unavailable";
-    $("scan-results-body").innerHTML = `<tr><td colspan="14" class="scan-no-results negative"><b>Could not load screener data.</b><span>${esc(error.message)}</span></td></tr>`;
-    return;
-  }
-  if (!turnoverWasSaved) {
-    filters.turnover = scanData.meta?.params?.turnover_gate_cr ?? null;
-    turnoverWasSaved = true;
-    saveFilters();
-  }
   renderFilterControls();
-  renderRows();
+  $("scan-load").addEventListener("click", loadScreener);
   document.querySelectorAll("[data-preset-jump]").forEach((button) => button.addEventListener("click", () => {
     const key = button.dataset.presetJump;
     applyPreset(key);
     $("screener").scrollIntoView({ behavior: "smooth", block: "start" });
   }));
+  if (!("IntersectionObserver" in window)) { loadScreener(); return; }
+  const observer = new IntersectionObserver((entries) => {
+    if (entries.some((entry) => entry.isIntersecting)) {
+      observer.disconnect();
+      loadScreener();
+    }
+  }, { rootMargin: "200px" });
+  observer.observe($("screener"));
 }
 
 function initNavigation() {

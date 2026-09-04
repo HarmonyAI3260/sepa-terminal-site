@@ -403,3 +403,6 @@ footer { padding: var(--s5) 0 0; color: var(--faint); font: .68rem var(--mono); 
 .minervini-checks { margin-top: 14px; color: var(--muted); }
 .minervini-checks ul { margin: 8px 0 0; padding-left: 20px; }
 .minervini-checks li { margin: 5px 0; }
+.scan-pagination { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 14px; }
+.scan-pagination button, #scan-load { min-height: 44px; }
+.scan-pagination span { font-size: .875rem; }
