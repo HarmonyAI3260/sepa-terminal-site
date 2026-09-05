@@ -179,10 +179,11 @@ function baseText(row) {
 }
 
 function fundHtml(fund) {
+  if (fund && !Screener.usableFund({fund})) return `<span class="muted" title="${esc(`financial history ends ${fund.period_end || fund.latest_period || 'unknown'} — not current`)}">${esc(fund.status || 'unknown')}</span>`;
   if (!fund) return '<span class="muted">–</span>';
   const value = (number) => number === null || number === undefined ? "–" : `${number > 0 ? "+" : ""}${fmt(number, 0)}%`;
-  const star = fund.code33_lite === true ? '<span class="fund-star" title="Code 33-lite">★</span>' : "";
-  return `<span title="${esc(`Latest quarter ${fund.latest_period || "–"}`)}">S${value(fund.sales_yoy)}·P${value(fund.pat_yoy)}${star}</span>`;
+  const star = fund.code33_lite === true ? '<span class="fund-star" title="Code 33 (lite: 2 of 3); legacy financial screen">★</span>' : "";
+  return `<span title="${esc(`Financial period ${fund.period_end || fund.latest_period || "–"} · ${fund.status || "unknown"}`)}">S${value(fund.sales_yoy)}·P${value(fund.pat_yoy)}${star}</span>`;
 }
 
 function sepaHtml(sepa) {
@@ -242,7 +243,7 @@ function renderRows(resetPage = true) {
   const ready = (scanData.rows || []).filter((row) => row.qualification?.ready === true).length;
   $("scan-count").textContent = `Universe ${fmt(meta.universe_total, 0)} · scanned ${fmt(meta.scanned, 0)} · 8/8: ${fmt(eight, 0)} · ready: ${fmt(ready, 0)} · shown: ${fmt(visibleRows.length, 0)}`;
   renderFilterControls();
-  if (Screener.financialOn(filters)) $("scan-count").textContent += ` · Financial criteria evaluated for ${visibleRows.filter(row => Screener.financialEvaluated(row, filters)).length} of ${visibleRows.length} rows`;
+  $("scan-count").textContent += ` · Financial criteria evaluated for ${visibleRows.filter(row => Screener.financialEvaluated(row, filters)).length} of ${visibleRows.length} rows`;
   $("scan-results-body").innerHTML = pageRows.map((row) => {
     const base = row.base || {};
     const dots = (row.tt?.checks || []).map((check) => {
@@ -429,7 +430,13 @@ async function initStock() {
   try {
     const response = await fetch(siteUrl(config.seriesPath), { cache: "no-store" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    bars = await response.json();
+    const series = await response.json();
+    bars = Array.isArray(series) ? series : series.bars;
+    if (series.note) {
+      const note = document.createElement("p");
+      note.className = "fineprint"; note.textContent = series.note;
+      container.parentElement.appendChild(note);
+    }
   } catch (error) {
     container.innerHTML = `<div class="chart-loading muted">Price series missing from this snapshot: ${esc(error.message)}</div>`;
     return;

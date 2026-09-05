@@ -62,7 +62,7 @@ const Screener = (() => {
   function usableFund(row) {
     const fund = row.fund;
     return !!fund && fund.stale !== true
-      && !["stale", "unknown", "missing", "error", "unavailable"].includes(fund.financial_status || fund.status || row.fund_status);
+      && ["current", "lagging"].includes(fund.status || fund.financial_status || row.fund_status);
   }
   function financialEvaluated(row, state) {
     if (!usableFund(row)) return false;
@@ -126,8 +126,8 @@ const Screener = (() => {
     return row.qualification?.pattern?.pivot ?? (row.power_play?.flag === true ? row.power_play.pivot : row.base?.pivot_hint);
   }
   function monthDelta(row, meta = {}) {
-    const available = meta.rs_1m_available_from || "2026-09-25";
-    if ((meta.as_of || row.last_date || "") < available) return `n/a until ${available}`;
+    const available = meta.rs_1m_available_from;
+    if (available && (meta.rs_1m_ready === false || (meta.as_of || row.last_date || "") < available)) return `n/a until ${available}`;
     return finite(row.rs_chg_1m) ? `${row.rs_chg_1m > 0 ? "+" : ""}${row.rs_chg_1m}` : "n/a";
   }
   function eventText(event) {
@@ -156,13 +156,13 @@ const Screener = (() => {
       const q = row.qualification || {}, p = q.pattern || {}, f = row.fund || {};
       lines.push([row.symbol, row.name, row.close, row.chg_pct, row.rs, row.rs_chg_1w, row.rs_chg_1m,
         row.tt?.passed, row.stage, row.turnover_cr, f.sales_yoy, f.pat_yoy, f.code33_lite, row.sepa?.score,
-        q.ready, row.last_date, f.latest_period, f.basis || row.fund_basis || "unknown",
-        f.stale ? "stale" : f.financial_status || f.status || row.fund_status || (row.fund ? "available" : "unknown"),
+        q.ready, row.last_date, f.period_end || f.latest_period, f.basis || row.fund_basis || "unknown",
+        f.stale ? "stale" : f.status || f.financial_status || row.fund_status || (row.fund ? "available" : "unknown"),
         p.id, p.pivot, p.stop, p.risk_pct, displayedPivot(row), distance(row.close, displayedPivot(row)),
         finite(displayedPivot(row)) && row.close > 0 ? 100 * (displayedPivot(row) - row.close) / row.close : null, row.stale].map(csvCell).join(","));
     }
     return lines.join("\n") + "\n";
   }
-  return { defaults, normalize, preset, activePreset, forSnapshot, financialOn, financialEvaluated, coverage,
+  return { defaults, normalize, preset, activePreset, forSnapshot, financialOn, financialEvaluated, usableFund, coverage,
     matches, distance, distanceText, displayedPivot, monthDelta, eventText, legMarkers, description, csvCell, csv };
 })();
