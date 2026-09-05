@@ -406,3 +406,9 @@ footer { padding: var(--s5) 0 0; color: var(--faint); font: .68rem var(--mono); 
 .scan-pagination { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 14px; }
 .scan-pagination button, #scan-load { min-height: 44px; }
 .scan-pagination span { font-size: .875rem; }
+
+/* Explicit growth alternatives and snapshot coverage. */
+.scan-growth { display:flex; flex-wrap:wrap; gap:.6rem; border:1px solid currentColor; padding:.4rem .6rem; border-radius:4px; }
+.scan-growth label { white-space:nowrap; }
+.filter-toggle:has(input:disabled) { opacity:.6; cursor:help; }
+.leg-evidence { grid-column:1 / -1; overflow-x:auto; }

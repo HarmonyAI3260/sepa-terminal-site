@@ -36,14 +36,7 @@ function initRefresh() {
   control.hidden = !owner;
 }
 
-const FILTER_DEFAULTS = {
-  tier: "8/8", rs: 70, stages: ["2"], turnover: null,
-  inBase: false, nearPivot: false, breakout: false, recentBreakout: false,
-  powerPlay: false, shelf: false, tightening: false, isNew: false, rsLineNh: false,
-  salesYoy: null, patYoy: null, accelerating: false, code33Lite: false,
-  forming: false, setupAny: false, fundamentalAny: false, minBoVol: null,
-  activePreset: null, query: "", sortKey: "tt", sortDir: "desc",
-};
+const FILTER_DEFAULTS = Screener.defaults;
 const FILTER_KEY = "sepa_screener_filters";
 const SEPA_LABELS = {
   trend: "Trend", fundamentals: "Fundamentals", catalyst: "Catalyst", entry: "Entry", exit: "Exit",
@@ -63,7 +56,7 @@ function loadFilters() {
     if (parsed && typeof parsed === "object") saved = parsed;
   } catch {}
   turnoverWasSaved = Object.prototype.hasOwnProperty.call(saved, "turnover");
-  const loaded = { ...FILTER_DEFAULTS, ...saved };
+  const loaded = Screener.normalize(saved);
   if (!["8/8", "≥7", "≥6", "All"].includes(loaded.tier)) loaded.tier = "8/8";
   const sortKeys = ["symbol", "close", "chg_pct", "rs", "tt", "stage", "pct_off_high", "pct_above_low", "turnover_cr", "fund", "sepa", "base", "pivot"];
   if (!sortKeys.includes(loaded.sortKey)) loaded.sortKey = "tt";
@@ -75,7 +68,7 @@ function loadFilters() {
 }
 
 function saveFilters() {
-  try { localStorage.setItem(FILTER_KEY, JSON.stringify(filters)); } catch {}
+  try { localStorage.setItem(FILTER_KEY, JSON.stringify(Screener.normalize(filters))); } catch {}
 }
 
 function baseStatus(base) {
@@ -84,27 +77,6 @@ function baseStatus(base) {
   if (!base?.in_base) return "none";
   const below = base.pct_below_pivot;
   return below !== null && below !== undefined && below >= 0 && below <= 5 ? "near_pivot" : "forming";
-}
-
-function commonPlaybookGate(row) {
-  return row.turnover_pass === true && row.rs !== null && row.rs !== undefined
-    && row.stale !== true && Number(row.history_sessions || 0) >= 250;
-}
-
-function presetMatches(row, name) {
-  const base = row.base || {};
-  const tt = Number(row.tt?.passed || 0);
-  const age = Number(base.crossed_sessions_ago ?? 99);
-  if (name === "ready") return commonPlaybookGate(row) && tt === 8 && row.rs >= 80
-    && ["near_pivot", "breakout"].includes(base.status)
-    && base.proper_vcp === true
-    && (base.status !== "breakout" || base.breakout_confirmed === true && age <= 5);
-  if (name === "fresh") return commonPlaybookGate(row) && tt >= 7 && row.rs >= 70
-    && base.status === "breakout" && base.pivot_lost !== true
-    && base.proper_vcp === true && base.breakout_confirmed === true && age >= 0 && age <= 5;
-  if (name === "power") return commonPlaybookGate(row) && row.power_play?.flag === true;
-  if (name === "earnings") return commonPlaybookGate(row);
-  return true;
 }
 
 function stageNumber(row) {
@@ -125,24 +97,28 @@ function rankDelta(value) {
 
 function renderFilterControls() {
   document.querySelectorAll(".playbook-presets button[data-preset]").forEach((button) =>
-    button.classList.toggle("active", button.dataset.preset === filters.activePreset));
+    button.classList.toggle("active", Screener.activePreset(filters, button.dataset.preset, scanData?.meta || {})));
   document.querySelectorAll("#scan-tier button[data-tier]").forEach((button) =>
     button.classList.toggle("active", button.dataset.tier === filters.tier));
   document.querySelectorAll("#scan-stages button[data-stage]").forEach((button) =>
     button.classList.toggle("active", filters.stages.includes(button.dataset.stage)));
-  $("scan-rs").value = filters.rs ?? 70;
+  $("scan-rs").value = filters.rs ?? 0;
   $("scan-turnover").value = filters.turnover ?? "";
   $("scan-in-base").checked = Boolean(filters.inBase);
   $("scan-near-pivot").checked = Boolean(filters.nearPivot);
   $("scan-breakout").checked = Boolean(filters.breakout);
   $("scan-recent-breakout").checked = Boolean(filters.recentBreakout);
   $("scan-power-play").checked = Boolean(filters.powerPlay);
-  $("scan-shelf").checked = Boolean(filters.shelf);
+
   $("scan-tightening").checked = Boolean(filters.tightening);
   $("scan-sales-yoy").value = filters.salesYoy ?? "";
   $("scan-pat-yoy").value = filters.patYoy ?? "";
   $("scan-accelerating").checked = Boolean(filters.accelerating);
-  $("scan-code33-lite").checked = Boolean(filters.code33Lite);
+  [["scan-proper-vcp", "properVcp"], ["scan-ready", "ready"], ["scan-forming", "forming"],
+    ["scan-current-only", "currentOnly"], ["scan-unknown-rs", "includeUnknownRs"]].forEach(([id, key]) => $(id).checked = Boolean(filters[key]));
+  $("scan-min-history").value = filters.minHistory ?? "";
+  document.querySelectorAll('input[name="scan-growth"]').forEach(input => input.checked = input.value === filters.growthMode);
+  renderCoverage();
   $("scan-new").checked = Boolean(filters.isNew);
   $("scan-rs-line-nh").checked = Boolean(filters.rsLineNh);
   $("scan-search").value = filters.query || "";
@@ -150,33 +126,7 @@ function renderFilterControls() {
 
 function applyPreset(name) {
   turnoverWasSaved = name !== "reset" || scanData !== null;
-  const reset = {
-    ...FILTER_DEFAULTS,
-    stages: [...FILTER_DEFAULTS.stages],
-    turnover: name === "reset" ? scanData?.meta?.params?.turnover_gate_cr ?? null : null,
-    activePreset: name === "reset" ? null : name,
-  };
-  if (name !== "reset") {
-    reset.tier = "All";
-    reset.rs = 0;
-    reset.stages = [];
-  }
-  if (name === "ready") Object.assign(reset, {
-    tier: "≥7", rs: 80, nearPivot: true, breakout: true,
-    setupAny: true,
-  });
-  if (name === "fresh") Object.assign(reset, { tier: "≥7", rs: 70, recentBreakout: true, minBoVol: 1.5 });
-  if (name === "power") reset.powerPlay = true;
-  if (name === "forming") reset.forming = true;
-  if (name === "in-base") reset.inBase = true;
-  if (name === "near-pivot") reset.nearPivot = true;
-  if (name === "breakout") reset.breakout = true;
-  if (name === "tightening") reset.tightening = true;
-  if (name === "earnings") Object.assign(reset, {
-    tier: "≥7", rs: 70, salesYoy: 20, patYoy: 20,
-    code33Lite: true, fundamentalAny: true,
-  });
-  filters = reset;
+  filters = Screener.preset(name, scanData?.meta || {});
   saveFilters();
   renderFilterControls();
   renderRows();
@@ -186,7 +136,7 @@ function sortValue(row, key) {
   if (key === "tt") return row.tt?.passed;
   if (key === "stage") return stageNumber(row);
   if (key === "base") return row.base?.in_base ? row.base.depth_pct : null;
-  if (key === "pivot") return row.base?.in_base ? row.base.pct_below_pivot : null;
+  if (key === "pivot") return Screener.distance(row.close, Screener.displayedPivot(row));
   if (key === "fund") return row.fund?.code33_lite === true
     ? 1000000 : Math.min(row.fund?.sales_yoy ?? -1000000, row.fund?.pat_yoy ?? -1000000);
   if (key === "sepa") return row.sepa?.score;
@@ -204,52 +154,7 @@ function compareValues(a, b, direction) {
 }
 
 function filteredRows() {
-  const tier = filters.tier;
-  const rsThreshold = Number(filters.rs) || 0;
-  const turnoverThreshold = Number(filters.turnover) || 0;
-  const query = String(filters.query || "").trim().toLowerCase();
-  const rows = (scanData?.rows || []).filter((row) => {
-    const passed = row.tt?.passed;
-    const tierOk = tier === "All" || tier === "8/8" && passed === 8
-      || tier === "≥7" && passed >= 7 || tier === "≥6" && passed >= 6;
-    const rsOk = row.rs === null ? tier === "All" : row.rs >= rsThreshold;
-    const stageOk = !filters.stages.length || filters.stages.some((stage) =>
-      String(row.stage || "").startsWith(`Stage ${stage}`));
-    const turnoverOk = turnoverThreshold <= 0
-      || row.turnover_cr !== null && row.turnover_cr >= turnoverThreshold;
-    const queryOk = !query || String(row.symbol || "").toLowerCase().includes(query)
-      || String(row.name || "").toLowerCase().includes(query);
-    const statusChecks = [];
-    if (filters.nearPivot) statusChecks.push(row.base?.status === "near_pivot");
-    if (filters.breakout) statusChecks.push(row.base?.status === "breakout");
-    if (filters.forming) statusChecks.push(row.base?.status === "forming");
-    const statusOk = !statusChecks.length || statusChecks.some(Boolean);
-    const setupChecks = [];
-    if (filters.tightening) setupChecks.push(row.base?.proper_vcp === true);
-    if (filters.shelf) setupChecks.push(row.base?.kind === "shelf");
-    const setupOk = !setupChecks.length || (filters.setupAny ? setupChecks.some(Boolean) : setupChecks.every(Boolean));
-    const fund = row.fund;
-    const salesOn = filters.salesYoy !== null && filters.salesYoy !== "";
-    const patOn = filters.patYoy !== null && filters.patYoy !== "";
-    const growthOn = salesOn || patOn;
-    const growthOk = (!salesOn || fund !== null && fund?.sales_yoy >= Number(filters.salesYoy))
-      && (!patOn || fund !== null && fund?.pat_yoy >= Number(filters.patYoy));
-    const fundChecks = [];
-    if (growthOn) fundChecks.push(growthOk);
-    if (filters.accelerating) fundChecks.push(fund?.sales_acc3 === true || fund?.pat_acc3 === true);
-    if (filters.code33Lite) fundChecks.push(fund?.code33_lite === true);
-    const fundOk = !fundChecks.length || (filters.fundamentalAny ? fundChecks.some(Boolean) : fundChecks.every(Boolean));
-    return tierOk && rsOk && stageOk && turnoverOk && queryOk
-      && presetMatches(row, filters.activePreset)
-      && (!filters.inBase || row.base?.in_base === true)
-      && statusOk && setupOk && fundOk
-      && (!filters.recentBreakout || row.recent_breakout === true
-        && row.base?.status === "breakout" && row.base?.pivot_lost !== true && row.stale !== true)
-      && (!filters.powerPlay || row.power_play?.flag === true)
-      && (filters.minBoVol === null || row.base?.breakout_vol_ratio >= filters.minBoVol)
-      && (!filters.isNew || row.new_since_prev === true)
-      && (!filters.rsLineNh || row.rs_line_nh === true);
-  });
+  const rows = (scanData?.rows || []).filter(row => Screener.matches(row, filters, scanData?.meta || {}));
   const key = filters.sortKey;
   return rows.sort((a, b) => {
     let result = compareValues(sortValue(a, key), sortValue(b, key), filters.sortDir);
@@ -265,7 +170,7 @@ function baseText(row) {
   const tags = { forming: "form", near_pivot: "near", breakout: "BO", extended: "ext", failed: "fail" };
   let text = row.power_play?.flag === true ? "PP·" : "";
   text += `${tags[status] || status}·${fmt(base.depth_pct)}%·${base.contraction_count || 0}c`;
-  if (base.vcp_valid === true) text += "·VCP";
+  if (base.vcp_trend_qualified === true) text += "·VCP";
   if (base.pivot_grade === "cheat") text += "·cheat";
   if (base.pivot_grade === "low") text += "·low-pivot";
   if (base.volume_dryup_ratio_10v50 !== null && base.volume_dryup_ratio_10v50 !== undefined
@@ -296,23 +201,27 @@ function rsHtml(row) {
   if (row.rs_chg_1w !== null && row.rs_chg_1w !== undefined) {
     const value = Number(row.rs_chg_1w);
     const mark = value > 0 ? `▲${Math.abs(value)}` : value < 0 ? `▼${Math.abs(value)}` : "·0";
-    delta = `<span class="rs-delta ${cls(value)}" title="${esc(`RS rank Δ: 1w ${rankDelta(row.rs_chg_1w)} · 1m ${rankDelta(row.rs_chg_1m)}`)}">${mark}</span>`;
+    delta = `<span class="rs-delta ${cls(value)}" title="${esc(`RS rank Δ: 1w ${rankDelta(row.rs_chg_1w)} · 1m ${Screener.monthDelta(row, scanData?.meta || {})}`)}">${mark}</span>`;
   }
   const star = row.rs_line_nh_before_price === true
     ? '<span class="rs-early-leadership" title="RS line at a 52-week high before price">★</span>' : "";
-  return `<b>${rank}</b>${delta}${star}`;
+  return `<b title="${esc(`1m ${Screener.monthDelta(row, scanData?.meta || {})}`)}">${rank}</b>${delta}${star}`;
 }
 
-function pivotDisplay(base) {
-  const status = String(base?.status || "none");
-  const value = base?.pct_below_pivot;
-  if (["breakout", "extended"].includes(status) && value !== null && value !== undefined) {
-    return { className: status === "extended" ? "negative" : "breakout-pivot", text: `+${Number(-value).toFixed(1)}%` };
-  }
-  if (["near_pivot", "forming"].includes(status) && value !== null && value !== undefined) {
-    return { className: status === "near_pivot" ? "near-pivot" : "", text: `${fmt(value)}%` };
-  }
-  return { className: "", text: "–" };
+function pivotDisplay(row) {
+  const value = Screener.distance(row.close, Screener.displayedPivot(row));
+  return { className: value < -5 ? "negative" : value >= 0 && value <= 3 ? "near-pivot" : "",
+    text: value === null ? "–" : Screener.distanceText(value) };
+}
+
+function renderCoverage() {
+  const coverage = Screener.coverage(scanData);
+  const rs = $("scan-rs-line-nh"), fresh = $("scan-new");
+  rs.disabled = !coverage.rsUsable;
+  rs.title = `RS-line NH: ${coverage.rsKnown} known of ${coverage.total}; ${coverage.rsUsable} at snapshot date`;
+  fresh.disabled = !coverage.previous;
+  fresh.title = coverage.previous ? `Compared with ${scanData.meta.prev_as_of}` : "New needs a previous distinct price session";
+  $("scan-coverage").textContent = `RS-line NH: ${coverage.rsKnown} known / ${coverage.total} (${coverage.rsUsable} current) · RS Δ1m ${Screener.monthDelta({}, scanData?.meta || {})}`;
 }
 
 function renderRows(resetPage = true) {
@@ -330,8 +239,10 @@ function renderRows(resetPage = true) {
   $("scan-next").disabled = scanPage >= pages - 1;
   const meta = scanData.meta || {};
   const eight = (scanData.rows || []).filter((row) => row.tt?.passed === 8).length;
-  const ready = (scanData.rows || []).filter((row) => row.sepa?.ready === true).length;
+  const ready = (scanData.rows || []).filter((row) => row.qualification?.ready === true).length;
   $("scan-count").textContent = `Universe ${fmt(meta.universe_total, 0)} · scanned ${fmt(meta.scanned, 0)} · 8/8: ${fmt(eight, 0)} · ready: ${fmt(ready, 0)} · shown: ${fmt(visibleRows.length, 0)}`;
+  renderFilterControls();
+  if (Screener.financialOn(filters)) $("scan-count").textContent += ` · Financial criteria evaluated for ${visibleRows.filter(row => Screener.financialEvaluated(row, filters)).length} of ${visibleRows.length} rows`;
   $("scan-results-body").innerHTML = pageRows.map((row) => {
     const base = row.base || {};
     const dots = (row.tt?.checks || []).map((check) => {
@@ -340,7 +251,7 @@ function renderRows(resetPage = true) {
     }).join("");
     const newBadge = row.new_since_prev ? '<span class="new-badge">NEW</span>' : "";
     const staleBadge = row.stale === true ? `<span class="stale-badge" title="${esc(`stale — last data ${row.last_date || "unknown"}`)}">●</span>` : "";
-    const pivot = pivotDisplay(base);
+    const pivot = pivotDisplay(row);
     const symbol = String(row.symbol || "");
     const symbolMarkup = row.has_page
       ? `<a class="scan-symbol" href="${siteUrl(`/s/${encodeURIComponent(symbol)}.html`)}">${esc(symbol)}</a>`
@@ -381,21 +292,8 @@ function downloadText(filename, text, type) {
   setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
-function csvCell(value) {
-  const text = String(value ?? "");
-  return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
-}
-
 function exportCsv() {
-  const headers = ["symbol", "name", "close", "chg_pct", "rs", "rs_chg_1w", "rs_chg_1m", "tt", "stage", "pct_off_high", "pct_above_low", "turnover_cr", "sales_yoy", "pat_yoy", "code33_lite", "sepa_score", "base", "pivot_delta"];
-  const lines = [headers.join(",")];
-  visibleRows.forEach((row) => lines.push([
-    row.symbol, row.name, row.close, row.chg_pct, row.rs, row.rs_chg_1w, row.rs_chg_1m,
-    row.tt?.passed, row.stage, row.pct_off_high, row.pct_above_low, row.turnover_cr,
-    row.fund?.sales_yoy, row.fund?.pat_yoy, row.fund?.code33_lite, row.sepa?.score,
-    baseText(row), pivotDisplay(row.base).text,
-  ].map(csvCell).join(",")));
-  downloadText("sepa-screener.csv", `${lines.join("\n")}\n`, "text/csv;charset=utf-8");
+  downloadText("sepa-screener.csv", Screener.csv(visibleRows, filters, scanData?.meta || {}), "text/csv;charset=utf-8");
 }
 
 function bindScreener() {
@@ -404,26 +302,29 @@ function bindScreener() {
   document.querySelectorAll(".playbook-presets button[data-preset]").forEach((button) =>
     button.addEventListener("click", () => applyPreset(button.dataset.preset)));
   document.querySelectorAll("#scan-tier button[data-tier]").forEach((button) =>
-    button.addEventListener("click", () => { filters.tier = button.dataset.tier; filters.activePreset = null; saveFilters(); renderFilterControls(); renderRows(); }));
+    button.addEventListener("click", () => { filters.tier = button.dataset.tier; saveFilters(); renderFilterControls(); renderRows(); }));
   document.querySelectorAll("#scan-stages button[data-stage]").forEach((button) =>
     button.addEventListener("click", () => {
       const stage = button.dataset.stage;
       filters.stages = filters.stages.includes(stage) ? filters.stages.filter((value) => value !== stage) : [...filters.stages, stage];
-      filters.activePreset = null;
+
       saveFilters(); renderFilterControls(); renderRows();
     }));
-  [["scan-rs", "rs"], ["scan-turnover", "turnover"], ["scan-sales-yoy", "salesYoy"], ["scan-pat-yoy", "patYoy"]].forEach(([id, key]) =>
+  [["scan-rs", "rs"], ["scan-turnover", "turnover"], ["scan-sales-yoy", "salesYoy"], ["scan-pat-yoy", "patYoy"], ["scan-min-history", "minHistory"]].forEach(([id, key]) =>
     $(id).addEventListener("input", (event) => {
-      filters[key] = event.target.value === "" ? null : Number(event.target.value);
+      filters[key] = event.target.value === "" ? (key === "rs" ? 0 : null) : Number(event.target.value);
       if (key === "turnover") turnoverWasSaved = true;
-      filters.activePreset = null; saveFilters(); renderRows();
+      saveFilters(); renderRows();
     }));
   [["scan-in-base", "inBase"], ["scan-near-pivot", "nearPivot"], ["scan-breakout", "breakout"],
-    ["scan-recent-breakout", "recentBreakout"], ["scan-power-play", "powerPlay"], ["scan-shelf", "shelf"],
-    ["scan-tightening", "tightening"], ["scan-accelerating", "accelerating"], ["scan-code33-lite", "code33Lite"],
+    ["scan-recent-breakout", "recentBreakout"], ["scan-power-play", "powerPlay"], ["scan-forming", "forming"], ["scan-proper-vcp", "properVcp"], ["scan-ready", "ready"], ["scan-current-only", "currentOnly"], ["scan-unknown-rs", "includeUnknownRs"],
+    ["scan-tightening", "tightening"], ["scan-accelerating", "accelerating"],
     ["scan-new", "isNew"], ["scan-rs-line-nh", "rsLineNh"]].forEach(([id, key]) =>
-    $(id).addEventListener("change", (event) => { filters[key] = event.target.checked; filters.activePreset = null; saveFilters(); renderFilterControls(); renderRows(); }));
-  $("scan-search").addEventListener("input", (event) => { filters.query = event.target.value; filters.activePreset = null; saveFilters(); renderRows(); });
+    $(id).addEventListener("change", (event) => { filters[key] = event.target.checked; saveFilters(); renderFilterControls(); renderRows(); }));
+  document.querySelectorAll('input[name="scan-growth"]').forEach(input => input.addEventListener("change", () => {
+    filters.growthMode = input.value; saveFilters(); renderRows();
+  }));
+  $("scan-search").addEventListener("input", (event) => { filters.query = event.target.value; saveFilters(); renderRows(); });
   document.querySelectorAll("#scan-results th[data-sort]").forEach((header) =>
     header.addEventListener("click", () => {
       const key = header.dataset.sort;
@@ -447,6 +348,8 @@ function loadScreener() {
       const data = await response.json();
       if (!Array.isArray(data?.rows)) throw new Error("Snapshot has no row list");
       scanData = data;
+      filters = Screener.forSnapshot(filters, scanData);
+      saveFilters();
       if (!turnoverWasSaved) {
         filters.turnover = scanData.meta?.params?.turnover_gate_cr ?? null;
         turnoverWasSaved = true;
@@ -565,13 +468,17 @@ async function initStock() {
     const values = movingAverage(closes, period);
     series.setData(bars.map((bar, index) => values[index] === null ? null : { time: bar[0], value: values[index] }).filter(Boolean));
   });
-  const pivot = config.pivot === null || config.pivot === undefined ? null : Number(config.pivot);
+  const pattern = config.qualification?.pattern || {};
+  const pivot = pattern.id ? pattern.pivot : null;
   if (Number.isFinite(pivot)) candles.createPriceLine({ price: pivot, color: "#2ee6a8", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "pivot" });
-  const stop = config.stop === null || config.stop === undefined ? null : Number(config.stop);
+  const reference = config.reference_pattern?.pivot ?? (!pattern.id ? config.geometry_pivot : null);
+  if (Number.isFinite(reference)) candles.createPriceLine({ price: reference, color: "#f5a623", lineWidth: 1, lineStyle: 2, title: config.reference_pattern ? "power play · flag forming" : "geometry pivot" });
+  candles.setMarkers(Screener.legMarkers(config.reference_pattern ? [] : config.legs, bars.map(bar => bar[0])));
+  const stop = pattern.id ? pattern.stop : null;
   if (Number.isFinite(stop)) candles.createPriceLine({ price: stop, color: "#ef5350", lineWidth: 1, lineStyle: 1, axisLabelVisible: true, title: "stop" });
   const positionBand = () => {
     if (!Number.isFinite(pivot)) { band.hidden = true; return; }
-    const upper = candles.priceToCoordinate(pivot * 1.05);
+    const upper = candles.priceToCoordinate(pattern.buy_zone_high);
     const lower = candles.priceToCoordinate(pivot);
     if (upper === null || lower === null) { band.hidden = true; return; }
     band.hidden = false;
