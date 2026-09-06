@@ -476,22 +476,152 @@ function movingAverage(values, period) {
   });
 }
 
+/* ── MarketSmith-parity stock page: chart, data panel, drawings, list nav ── */
+const PANEL_KEY = "sepa_panel_open";
+const TIMEFRAME_KEY = "sepa_timeframe";
+const LIST_CONTEXT_KEY = "sepa_list_context";
+const DEFAULT_LIST = "growth-50";
+
+async function fetchJson(path) {
+  const response = await fetch(siteUrl(path), { cache: "no-store" });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json();
+}
+
+function readListParams() {
+  const params = new URLSearchParams(window.location.search);
+  const id = params.get("list");
+  const index = Number.parseInt(params.get("i"), 10);
+  if (id) return { id, index: Number.isInteger(index) ? index : -1, fallback: false };
+  try {
+    const stored = JSON.parse(sessionStorage.getItem(LIST_CONTEXT_KEY) || "null");
+    if (stored && stored.id) return { ...stored, fallback: false };
+  } catch { /* a corrupt session entry is simply no context */ }
+  return { id: DEFAULT_LIST, index: -1, fallback: true };
+}
+
+async function loadListContext(symbol) {
+  const requested = readListParams();
+  try {
+    const payload = await fetchJson(`/data/lists/${requested.id}.json`);
+    const context = MSChart.listContext(
+      { id: payload.id, title: payload.title, symbols: payload.symbols, index: requested.index },
+      symbol);
+    context.fallback = requested.fallback;
+    return context;
+  } catch {
+    return { id: null, title: null, symbols: [], index: -1, position: null, fallback: true,
+      error: `list ${requested.id} is not published in this snapshot` };
+  }
+}
+
+function renderListNav(context) {
+  const label = $("list-position");
+  if (!label) return;
+  if (!context.symbols.length) {
+    label.textContent = context.error || "no list context";
+    return;
+  }
+  const suffix = context.fallback ? ` · default list (${context.title || context.id})`
+    : ` in ${context.title || context.id}`;
+  label.textContent = context.position ? `${context.position}${suffix}`
+    : `not in ${context.title || context.id}`;
+}
+
+function gotoListEntry(context, result) {
+  if (!result.ok) {
+    const label = $("list-position");
+    if (label && result.needsConfirmation) {
+      label.textContent = `${result.reason} — press again to wrap`;
+      label.dataset.confirmWrap = "1";
+    }
+    return false;
+  }
+  try {
+    sessionStorage.setItem(LIST_CONTEXT_KEY, JSON.stringify({ id: context.id, index: result.index }));
+  } catch { /* private mode: navigation still works through the query string */ }
+  window.location.href = siteUrl(`/s/${result.symbol}.html?list=${encodeURIComponent(context.id)}&i=${result.index}`);
+  return true;
+}
+
+function bindListNavigation(context) {
+  const move = (step) => {
+    const label = $("list-position");
+    const confirmWrap = label?.dataset.confirmWrap === "1";
+    const result = MSChart.advance(context, step, { confirmWrap });
+    if (label) delete label.dataset.confirmWrap;
+    gotoListEntry(context, result);
+  };
+  $("list-prev")?.addEventListener("click", () => move(-1));
+  $("list-next")?.addEventListener("click", () => move(1));
+  $("list-open")?.addEventListener("click", () => toggleListDrawer(context));
+  return move;
+}
+
+function toggleListDrawer(context) {
+  let drawer = $("list-drawer");
+  if (drawer) { drawer.hidden = !drawer.hidden; return; }
+  drawer = document.createElement("aside");
+  drawer.id = "list-drawer";
+  drawer.className = "list-drawer";
+  const items = context.symbols.map((symbol, index) =>
+    `<li${index === context.index ? ' class="current"' : ""}><a href="${esc(siteUrl(`/s/${symbol}.html?list=${encodeURIComponent(context.id)}&i=${index}`))}">${esc(symbol)}</a></li>`).join("");
+  drawer.innerHTML = `<h3>${esc(context.title || context.id || "List")}</h3><ol>${items}</ol>`;
+  document.body.appendChild(drawer);
+  drawer.querySelector("li.current")?.scrollIntoView({ block: "center" });
+}
+
+function bindTabs() {
+  const tabs = [...document.querySelectorAll("#stock-tabs a[data-tab]")];
+  if (!tabs.length) return () => {};
+  const activate = (anchor) => {
+    tabs.forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === anchor));
+    document.getElementById(anchor)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+  tabs.forEach((tab) => tab.addEventListener("click", () => activate(tab.dataset.tab)));
+  return (index) => { const tab = tabs[index - 1]; if (tab) activate(tab.dataset.tab); };
+}
+
+function panelOpen() {
+  try { return localStorage.getItem(PANEL_KEY) !== "0"; } catch { return true; }
+}
+
+function setPanel(open) {
+  document.querySelector(".chart-layout")?.classList.toggle("panel-hidden", !open);
+  $("toggle-panel")?.setAttribute("aria-pressed", String(open));
+  try { localStorage.setItem(PANEL_KEY, open ? "1" : "0"); } catch { /* private mode */ }
+}
+
+function storedTimeframe() {
+  try { return MSChart.TIMEFRAMES.includes(localStorage.getItem(TIMEFRAME_KEY)) ? localStorage.getItem(TIMEFRAME_KEY) : "W"; }
+  catch { return "W"; }
+}
+
 async function initStock() {
   const container = $("chart");
   let config;
   try {
     config = JSON.parse($("stock-data").textContent);
   } catch {
-    container.innerHTML = '<div class="chart-loading negative">Invalid chart configuration.</div>';
+    if (container) container.innerHTML = '<div class="chart-loading negative">Invalid chart configuration.</div>';
     return;
   }
-  let bars;
+  const symbol = String(config.symbol || "");
+  const context = await loadListContext(symbol);
+  renderListNav(context);
+  const move = bindListNavigation(context);
+  const gotoTab = bindTabs();
+  setPanel(panelOpen());
+  $("toggle-panel")?.addEventListener("click", () => setPanel(document.querySelector(".chart-layout")?.classList.contains("panel-hidden")));
+
+  let daily = [];
+  let weekly = [];
+  let indexCloses = new Map();
+  let rsCloses = new Map();
   try {
-    const response = await fetch(siteUrl(config.seriesPath), { cache: "no-store" });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const series = await response.json();
-    bars = Array.isArray(series) ? series : series.bars;
-    checkBuildId(series.build_id, Array.isArray(bars) && bars.length ? bars[bars.length - 1][0] : null);
+    const series = await fetchJson(config.seriesPath);
+    daily = Array.isArray(series) ? series : series.bars || [];
+    checkBuildId(series.build_id, daily.length ? daily[daily.length - 1][0] : null);
     if (series.note) {
       const note = document.createElement("p");
       note.className = "fineprint"; note.textContent = series.note;
@@ -501,7 +631,22 @@ async function initStock() {
     container.innerHTML = `<div class="chart-loading muted">Price series missing from this snapshot: ${esc(error.message)}</div>`;
     return;
   }
-  if (!Array.isArray(bars) || !bars.length) {
+  try {
+    const payload = await fetchJson(config.weeklyPath);
+    weekly = payload.bars || [];
+  } catch { weekly = MSChart.aggregate(daily, "W"); }
+  for (const [path, target] of [[config.indexPath, "index"], [config.rsIndexPath, "rs"]]) {
+    if (!path) continue;
+    try {
+      const payload = await fetchJson(path);
+      const pairs = payload.closes && payload.closes.length
+        ? payload.closes : (payload.bars || []).map((bar) => [bar[0], bar[4]]);
+      const map = new Map(pairs.map(([day, value]) => [String(day), Number(value)]));
+      if (target === "index") indexCloses = map; else rsCloses = map;
+    } catch { /* an unpublished index simply has no overlay */ }
+  }
+
+  if (!daily.length) {
     container.innerHTML = '<div class="chart-loading muted">Price series missing from this snapshot.</div>';
     return;
   }
@@ -509,42 +654,100 @@ async function initStock() {
     container.innerHTML = '<div class="chart-loading muted">Chart library unavailable. Technical tables and snapshot figures remain available.</div>';
     return;
   }
-  container.innerHTML = '<div class="chart-host"></div><div class="buy-zone-band" aria-hidden="true"><span>Risk-approved entry band</span></div>';
+  container.innerHTML = '<div class="chart-host"></div><svg class="draw-overlay" id="draw-overlay"></svg>'
+    + '<div class="buy-zone-band" aria-hidden="true"><span>Risk-approved entry band</span></div>';
   const host = container.querySelector(".chart-host");
+  const overlay = $("draw-overlay");
   const band = container.querySelector(".buy-zone-band");
   const chart = LightweightCharts.createChart(host, {
     layout: { background: { color: "transparent" }, textColor: "#8a97a8", fontFamily: "IBM Plex Mono, monospace" },
     grid: { vertLines: { color: "#1d2733" }, horzLines: { color: "#1d2733" } },
-    rightPriceScale: { borderColor: "#2a3542", scaleMargins: { top: 0.08, bottom: 0.18 } },
+    rightPriceScale: { borderColor: "#2a3542", scaleMargins: { top: 0.08, bottom: 0.18 },
+      mode: LightweightCharts.PriceScaleMode.Logarithmic },
     timeScale: { borderColor: "#2a3542", timeVisible: false, rightOffset: 4 },
     crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-    height: Math.max(420, container.clientHeight), autoSize: true,
+    height: Math.max(460, container.clientHeight), autoSize: true,
   });
   const candles = chart.addCandlestickSeries({
-    upColor: "#2ee6a8", downColor: "#ef5350", wickUpColor: "#2ee6a8", wickDownColor: "#ef5350", borderVisible: false,
+    upColor: "#4da3ff", downColor: "#ff5fa2", wickUpColor: "#4da3ff", wickDownColor: "#ff5fa2",
+    borderVisible: false,
   });
-  candles.setData(bars.map(([time, open, high, low, close]) => ({ time, open, high, low, close })));
   const volume = chart.addHistogramSeries({ priceScaleId: "vol", priceFormat: { type: "volume" } });
   chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
-  volume.setData(bars.map(([time, open, , , close, value]) => ({
-    time, value, color: close >= open ? "rgba(46,230,168,.35)" : "rgba(239,83,80,.35)",
-  })));
-  const closes = bars.map((bar) => bar[4]);
-  [[50, "#4da3ff"], [150, "#f5a623"], [200, "#d678ff"]].forEach(([period, color]) => {
-    const series = chart.addLineSeries({ color, lineWidth: 1.4, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
-    const values = movingAverage(closes, period);
-    series.setData(bars.map((bar, index) => values[index] === null ? null : { time: bar[0], value: values[index] }).filter(Boolean));
-  });
-  const pattern = config.qualification?.pattern || {};
+  const volumeAverage = chart.addLineSeries({ priceScaleId: "vol", color: "#f5a623", lineWidth: 1,
+    priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
+  const maSeries = [0, 1, 2].map(() => chart.addLineSeries({ lineWidth: 1.4, priceLineVisible: false,
+    lastValueVisible: false, crosshairMarkerVisible: false }));
+  const rsSeries = chart.addLineSeries({ color: "#2ee6a8", lineWidth: 1.2, priceLineVisible: false,
+    lastValueVisible: false, crosshairMarkerVisible: false });
+  const indexSeries = chart.addLineSeries({ color: "#8a97a8", lineWidth: 1, priceScaleId: "idx",
+    priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
+  chart.priceScale("idx").applyOptions({ visible: false, scaleMargins: { top: 0.08, bottom: 0.18 } });
+
+  const pattern = (config.qualification && config.qualification.pattern) || {};
   const pivot = pattern.id ? pattern.pivot : null;
-  if (Number.isFinite(pivot)) candles.createPriceLine({ price: pivot, color: "#2ee6a8", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "pivot" });
-  if (pattern.id && Number.isFinite(pattern.extension_limit)) candles.createPriceLine({ price: pattern.extension_limit, color: "#f5a623", lineWidth: 1, lineStyle: 2, title: "5% extension limit" });
-  const reference = config.reference_pattern?.pivot ?? (!pattern.id ? config.geometry_pivot : null);
-  if (Number.isFinite(reference)) candles.createPriceLine({ price: reference, color: "#f5a623", lineWidth: 1, lineStyle: 2, title: config.reference_pattern ? "power play · flag forming" : "geometry pivot" });
-  candles.setMarkers(Screener.legMarkers(config.reference_pattern ? [] : config.legs, bars.map(bar => bar[0])));
-  const stop = pattern.id ? pattern.stop : null;
-  if (Number.isFinite(stop)) candles.createPriceLine({ price: stop, color: "#ef5350", lineWidth: 1, lineStyle: 1, axisLabelVisible: true, title: "stop" });
+  const priceLines = [];
+  const drawPriceLine = (price, options) => {
+    if (!Number.isFinite(price)) return;
+    priceLines.push(candles.createPriceLine({ price, ...options }));
+  };
+  let timeframe = storedTimeframe();
+  let indexVisible = false;
+  let bars = [];
+
+  function render() {
+    bars = timeframe === "D" ? daily : timeframe === "W"
+      ? (weekly.length ? weekly : MSChart.aggregate(daily, "W")) : MSChart.aggregate(daily, "M");
+    candles.setData(bars.map(([time, open, high, low, close]) => ({ time, open, high, low, close })));
+    const volumes = MSChart.volumeSeries(bars, timeframe === "D" ? 50 : 10);
+    volume.setData(volumes.map((entry) => ({ time: entry.time, value: entry.value,
+      color: entry.up ? "rgba(77,163,255,.35)" : "rgba(255,95,162,.35)" })));
+    volumeAverage.setData(volumes.filter((entry) => entry.average !== null)
+      .map((entry) => ({ time: entry.time, value: entry.average })));
+    const closes = bars.map((bar) => bar[4]);
+    const periods = MSChart.MA_PERIODS[timeframe];
+    const colors = ["#4da3ff", "#f5a623", "#d678ff"];
+    maSeries.forEach((series, index) => {
+      const period = periods[index];
+      if (!period) { series.setData([]); return; }
+      const values = MSChart.movingAverage(closes, period);
+      series.applyOptions({ color: colors[index] });
+      series.setData(bars.map((bar, position) => values[position] === null
+        ? null : { time: bar[0], value: values[position] }).filter(Boolean));
+    });
+    const rs = MSChart.rsLine(bars, rsCloses, { lookback: MSChart.RS_LOOKBACK[timeframe] });
+    rsSeries.setData(rs.points.map((point) => ({ time: point.time, value: point.value })));
+    const rating = (config.ratings_compact || {}).rs;
+    const markers = rs.highs.map((point) => ({ time: point.time, position: "belowBar",
+      color: "#2ee6a8", shape: "circle", size: 0.6 }));
+    if (rs.points.length && rating) {
+      markers.push({ time: rs.points[rs.points.length - 1].time, position: "belowBar",
+        color: "#2ee6a8", shape: "arrowUp", text: `RS ${rating}` });
+    }
+    const legMarkers = Screener.legMarkers(config.reference_pattern ? [] : config.legs,
+      bars.map((bar) => bar[0]));
+    candles.setMarkers([...legMarkers, ...markers]);
+    indexSeries.setData(indexVisible
+      ? bars.map((bar) => (indexCloses.has(String(bar[0]))
+        ? { time: bar[0], value: indexCloses.get(String(bar[0])) } : null)).filter(Boolean)
+      : []);
+    priceLines.splice(0).forEach((line) => candles.removePriceLine(line));
+    drawPriceLine(pivot, { color: "#2ee6a8", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "pivot" });
+    if (pattern.id) drawPriceLine(pattern.extension_limit, { color: "#f5a623", lineWidth: 1, lineStyle: 2, title: "5% extension limit" });
+    if (pattern.id) drawPriceLine(pattern.stop, { color: "#ef5350", lineWidth: 1, lineStyle: 1, axisLabelVisible: true, title: "stop" });
+    const reference = config.reference_pattern?.pivot ?? (!pattern.id ? config.geometry_pivot : null);
+    if (Number.isFinite(reference)) drawPriceLine(reference, { color: "#f5a623", lineWidth: 1, lineStyle: 2,
+      title: config.reference_pattern ? "power play · flag forming" : "geometry pivot" });
+    const labels = MSChart.priceLabels(bars);
+    drawPriceLine(labels.high, { color: "#3a4756", lineWidth: 1, lineStyle: 3, axisLabelVisible: true, title: "52w high" });
+    drawPriceLine(labels.low, { color: "#3a4756", lineWidth: 1, lineStyle: 3, axisLabelVisible: true, title: "52w low" });
+    chart.timeScale().fitContent();
+    positionBand();
+    renderDrawings();
+  }
+
   const positionBand = () => {
+    if (!band) return;
     if (!Number.isFinite(pivot) || !Number.isFinite(pattern.buy_zone_high) || pattern.buy_zone_high <= pivot) { band.hidden = true; return; }
     const upper = candles.priceToCoordinate(pattern.buy_zone_high);
     const lower = candles.priceToCoordinate(pivot);
@@ -553,16 +756,281 @@ async function initStock() {
     band.style.top = `${Math.min(upper, lower)}px`;
     band.style.height = `${Math.abs(lower - upper)}px`;
   };
-  chart.timeScale().fitContent();
+
+  /* ── drawings ── */
+  const adapter = {
+    timeToCoordinate: (time) => chart.timeScale().timeToCoordinate(time),
+    priceToCoordinate: (price) => candles.priceToCoordinate(price),
+  };
+  let drawings = MSChart.loadDrawings(symbol, localStorage);
+  let tool = "select";
+  let pending = null;
+  let selected = null;
+
+  function svg(name, attributes) {
+    const node = document.createElementNS("http://www.w3.org/2000/svg", name);
+    Object.entries(attributes).forEach(([key, value]) => node.setAttribute(key, String(value)));
+    return node;
+  }
+
+  function renderDrawings() {
+    if (!overlay) return;
+    overlay.innerHTML = "";
+    const width = host.clientWidth;
+    const height = host.clientHeight;
+    overlay.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    overlay.setAttribute("width", width);
+    overlay.setAttribute("height", height);
+    for (const drawing of drawings.concat(pending ? [pending] : [])) {
+      const projected = MSChart.project(drawing, adapter);
+      if (!projected) continue;
+      const stroke = drawing.color;
+      const active = selected && selected.id === drawing.id;
+      const common = { stroke, "stroke-width": active ? 2.4 : 1.4, fill: "none",
+        "data-drawing": drawing.id };
+      if (drawing.tool === "hline") {
+        overlay.appendChild(svg("line", { x1: 0, x2: width, y1: projected.y, y2: projected.y, ...common }));
+      } else if (drawing.tool === "rect") {
+        const [a, b] = projected.points;
+        overlay.appendChild(svg("rect", { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y),
+          width: Math.abs(b.x - a.x), height: Math.abs(b.y - a.y), ...common,
+          fill: `${stroke}22` }));
+      } else if (drawing.tool === "text") {
+        const [anchor] = projected.points;
+        const label = svg("text", { x: anchor.x, y: anchor.y, fill: stroke, "data-drawing": drawing.id,
+          "font-size": 12 });
+        label.textContent = drawing.text || "note";
+        overlay.appendChild(label);
+      } else {
+        const [a, b] = projected.points;
+        const extended = drawing.tool === "ray"
+          ? { x: a.x + (b.x - a.x) * 40, y: a.y + (b.y - a.y) * 40 } : b;
+        overlay.appendChild(svg("line", { x1: a.x, y1: a.y, x2: extended.x, y2: extended.y, ...common }));
+      }
+    }
+  }
+
+  function pointFromEvent(event) {
+    const rect = host.getBoundingClientRect();
+    const x = event.clientX - rect.left;
+    const y = event.clientY - rect.top;
+    const time = chart.timeScale().coordinateToTime(x);
+    let price = candles.coordinateToPrice(y);
+    if (event.shiftKey && time) price = MSChart.snapToClose(price, bars, time);
+    return { x, y, time, price };
+  }
+
+  function persist() {
+    MSChart.saveDrawings(symbol, drawings, localStorage);
+    renderDrawings();
+  }
+
+  overlay?.addEventListener("mousedown", (event) => {
+    const point = pointFromEvent(event);
+    if (tool === "select") {
+      selected = MSChart.hitTest(drawings, point, adapter);
+      renderDrawings();
+      return;
+    }
+    if (!point.time || !Number.isFinite(point.price)) return;
+    if (tool === "hline") {
+      drawings.push(MSChart.createDrawing("hline", [{ time: point.time, price: point.price }]));
+      persist();
+      return;
+    }
+    if (tool === "text") {
+      const text = window.prompt("Note text");
+      if (text) {
+        drawings.push(MSChart.createDrawing("text", [{ time: point.time, price: point.price }], { text }));
+        persist();
+      }
+      return;
+    }
+    pending = MSChart.createDrawing(tool, [{ time: point.time, price: point.price },
+      { time: point.time, price: point.price }]);
+  });
+  overlay?.addEventListener("mousemove", (event) => {
+    if (!pending) return;
+    const point = pointFromEvent(event);
+    if (!point.time || !Number.isFinite(point.price)) return;
+    pending.points[1] = { time: point.time, price: point.price };
+    renderDrawings();
+  });
+  overlay?.addEventListener("mouseup", () => {
+    if (!pending) return;
+    drawings.push(pending);
+    pending = null;
+    persist();
+  });
+  document.querySelectorAll("[data-draw]").forEach((button) => button.addEventListener("click", () => {
+    tool = button.dataset.draw;
+    document.querySelectorAll("[data-draw]").forEach((other) =>
+      other.setAttribute("aria-pressed", String(other === button)));
+    overlay?.classList.toggle("drawing", tool !== "select");
+  }));
+  document.querySelector('[data-draw-action="clear"]')?.addEventListener("click", () => {
+    drawings = []; selected = null; persist();
+  });
+  document.querySelector('[data-draw-action="export"]')?.addEventListener("click", () => {
+    downloadText(`${symbol}-drawings.json`, MSChart.exportDrawings(symbol, drawings), "application/json");
+  });
+  document.querySelector('[data-draw-action="import"]')?.addEventListener("click", () => {
+    const text = window.prompt("Paste exported drawings JSON");
+    if (!text) return;
+    try { drawings = drawings.concat(MSChart.importDrawings(text)); persist(); }
+    catch { window.alert("That is not a drawings export from this app."); }
+  });
+
+  document.querySelectorAll("[data-timeframe]").forEach((button) => button.addEventListener("click", () => {
+    timeframe = button.dataset.timeframe;
+    try { localStorage.setItem(TIMEFRAME_KEY, timeframe); } catch { /* private mode */ }
+    document.querySelectorAll("[data-timeframe]").forEach((other) =>
+      other.setAttribute("aria-pressed", String(other.dataset.timeframe === timeframe)));
+    render();
+  }));
+  $("toggle-index")?.addEventListener("click", () => {
+    indexVisible = !indexVisible;
+    $("toggle-index").setAttribute("aria-pressed", String(indexVisible));
+    render();
+  });
+  document.querySelectorAll("[data-expand]").forEach((button) => button.addEventListener("click", () => {
+    button.previousElementSibling?.classList.add("expanded");
+    button.remove();
+  }));
+
+  window.addEventListener("keydown", (event) => {
+    const action = MSChart.keyAction(event);
+    if (!action) return;
+    if (action === "next" || action === "prev") { event.preventDefault(); move(action === "next" ? 1 : -1); return; }
+    if (action === "first" || action === "last") {
+      const target = action === "first" ? 0 : context.symbols.length - 1;
+      if (context.symbols.length) gotoListEntry(context, { ok: true, index: target, symbol: context.symbols[target] });
+      return;
+    }
+    if (action.startsWith("timeframe:")) {
+      document.querySelector(`[data-timeframe="${action.slice(10)}"]`)?.click();
+      return;
+    }
+    if (action === "panel") { setPanel(document.querySelector(".chart-layout")?.classList.contains("panel-hidden")); return; }
+    if (action === "list") { toggleListDrawer(context); return; }
+    if (action === "cancel") { pending = null; selected = null; tool = "select"; renderDrawings(); return; }
+    if (action === "delete" && selected) {
+      drawings = drawings.filter((entry) => entry.id !== selected.id);
+      selected = null;
+      persist();
+      return;
+    }
+    if (action.startsWith("tab:")) gotoTab(Number(action.slice(4)));
+  });
+
+  chart.timeScale().subscribeVisibleTimeRangeChange(() => { positionBand(); renderDrawings(); });
   chart.timeScale().subscribeVisibleLogicalRangeChange(positionBand);
-  new ResizeObserver(positionBand).observe(host);
-  requestAnimationFrame(() => requestAnimationFrame(positionBand));
+  new ResizeObserver(() => { positionBand(); renderDrawings(); }).observe(host);
+  document.querySelectorAll("[data-timeframe]").forEach((other) =>
+    other.setAttribute("aria-pressed", String(other.dataset.timeframe === timeframe)));
+  render();
+  requestAnimationFrame(() => requestAnimationFrame(() => { positionBand(); renderDrawings(); }));
+}
+
+/* ── list pages ───────────────────────────────────────────────────────────── */
+function initSidebar() {
+  const toggle = $("sidebar-toggle");
+  const body = $("sidebar-body");
+  if (!toggle || !body) return;
+  toggle.addEventListener("click", () => {
+    const open = body.classList.toggle("open");
+    toggle.setAttribute("aria-expanded", String(open));
+  });
+}
+
+async function initList() {
+  const target = $("list-render");
+  const configNode = $("list-config");
+  if (!target || !configNode) return;
+  let payload;
+  try {
+    const config = JSON.parse(configNode.textContent);
+    payload = await fetchJson(config.path);
+    checkBuildId(payload.build_id, payload.as_of);
+  } catch (error) {
+    target.insertAdjacentHTML("afterbegin",
+      `<p class="fineprint negative">Live list data could not be loaded (${esc(error.message)}); the table above is the published snapshot.</p>`);
+    return;
+  }
+  const controls = $("list-controls");
+  if (controls) controls.hidden = false;
+  const select = $("list-sort");
+  const options = Lists.sortOptions(payload);
+  if (select) {
+    select.innerHTML = options.map((option) => `<option value="${esc(option.key)}">${esc(option.label)}</option>`).join("");
+    select.value = payload.columns.includes("composite") ? "composite" : payload.columns[0];
+  }
+  let view = payload.view === "table" ? "table" : "cards";
+  let sortKey = select ? select.value : payload.columns[0];
+  let pageIndex = 1;
+  const extrasFor = (row) => ({ included_in: (payload.included_in || {})[row.symbol] });
+
+  function ordered() {
+    return Lists.sortRows(payload.rows, sortKey, Lists.defaultDirection(sortKey), extrasFor);
+  }
+
+  function renderTable(rows) {
+    const head = payload.columns.map((key) => `<th>${esc((payload.column_labels || {})[key] || key)}</th>`).join("");
+    const body = rows.map((row) => `<tr>${payload.columns.map((key) => {
+      if (key === "symbol") {
+        const href = row.has_page ? Lists.listLink(payload.id, payload.symbols, row.symbol,
+          document.documentElement.dataset.basePath || "") : siteUrl("/#screener");
+        return `<td><a class="list-symbol" href="${esc(href)}">${esc(row.symbol)}</a></td>`;
+      }
+      return `<td>${esc(Lists.formatCell(row, key, extrasFor(row)))}</td>`;
+    }).join("")}</tr>`).join("");
+    return `<div class="detail-table-wrap"><table class="detail-table list-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+  }
+
+  function renderCards(rows) {
+    return `<div class="list-cards">${rows.map((row) => {
+      const card = Lists.cardModel(row, (payload.sparks || {})[row.symbol], extrasFor(row));
+      const href = row.has_page ? Lists.listLink(payload.id, payload.symbols, row.symbol,
+        document.documentElement.dataset.basePath || "") : siteUrl("/#screener");
+      const spark = card.spark
+        ? `<svg class="spark" viewBox="0 0 160 44" preserveAspectRatio="none"><polyline points="${esc(card.spark)}"/></svg>`
+        : `<p class="spark-missing">no weekly series published for this symbol</p>`;
+      return `<article class="list-card"><a href="${esc(href)}"><header><b>${esc(card.symbol)}</b><small>${esc(card.name)}</small></header>
+        ${spark}
+        <div class="list-card-price"><b>${esc(card.close)}</b><span class="${esc(card.changeClass)}">${esc(card.change)}</span></div>
+        <dl>${card.ratings.map((entry) => `<div><dt>${esc(entry.label)}</dt><dd>${esc(entry.value)}</dd></div>`).join("")}</dl></a></article>`;
+    }).join("")}</div>`;
+  }
+
+  function draw() {
+    const rows = ordered();
+    const paged = Lists.page(rows, Lists.PAGE_SIZE, pageIndex);
+    target.innerHTML = view === "cards" ? renderCards(paged.rows) : renderTable(paged.rows);
+    const more = $("list-more");
+    if (more) {
+      more.hidden = !paged.more;
+      more.textContent = `Show more (${paged.shown} of ${rows.length})`;
+    }
+    document.querySelectorAll("[data-list-view]").forEach((button) =>
+      button.setAttribute("aria-pressed", String(button.dataset.listView === view)));
+  }
+
+  select?.addEventListener("change", () => { sortKey = select.value; pageIndex = 1; draw(); });
+  document.querySelectorAll("[data-list-view]").forEach((button) => button.addEventListener("click", () => {
+    view = button.dataset.listView; pageIndex = 1; draw();
+  }));
+  $("list-more")?.addEventListener("click", () => { pageIndex += 1; draw(); });
+  $("list-export")?.addEventListener("click", () =>
+    downloadText(`${payload.id}-${payload.as_of || "snapshot"}.csv`, Lists.csv(payload, ordered()), "text/csv"));
+  draw();
 }
 
 initRefresh();
 initNavigation();
+initSidebar();
 if (document.body.dataset.page === "screener") initScreener();
 if (document.body.dataset.page === "stock") initStock();
+if (document.body.dataset.page === "list") initList();
 
 // Progressive web app: keeps the last snapshot readable offline and satisfies the
 // installability criteria the Android wrapper (Trusted Web Activity) expects.
