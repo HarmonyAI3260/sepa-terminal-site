@@ -7,7 +7,7 @@ const CACHE_PREFIX = `sepa-terminal:${encodeURIComponent(SCOPE.pathname)}:`;
 // beside this build's pages, whatever the app-shell digest says.
 const BUILD_ID = "10fb8dfa0c0d";
 const BUILD_PREFIX = `${CACHE_PREFIX}${BUILD_ID}:`;
-const CACHE_NAME = BUILD_PREFIX + "7d78138aeb81-dd0b438e7990";
+const CACHE_NAME = BUILD_PREFIX + "7d78138aeb81-7e06c95bffdc";
 const APP_SHELL = ["./", "index.html", "site.css", "site.js", "screener.js", "manifest.webmanifest", "privacy.html", "offline.html", "404.html", "icons/icon-192.png", "icons/icon-512.png", "icons/maskable-192.png", "icons/maskable-512.png", "icons/apple-touch-icon.png", "icons/feature-graphic.png"];
 const SHELL_URLS = new Set(APP_SHELL.map(path => new URL(path, SCOPE).href));
 const OFFLINE_URL = new URL("offline.html", SCOPE).href;
