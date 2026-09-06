@@ -503,3 +503,12 @@ initRefresh();
 initNavigation();
 if (document.body.dataset.page === "screener") initScreener();
 if (document.body.dataset.page === "stock") initStock();
+
+// Progressive web app: keeps the last snapshot readable offline and satisfies the
+// installability criteria the Android wrapper (Trusted Web Activity) expects.
+if (typeof navigator !== "undefined" && "serviceWorker" in navigator &&
+    typeof window !== "undefined" && window.isSecureContext) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register(siteUrl("/sw.js"), { scope: siteUrl("/") }).catch(() => {});
+  });
+}
