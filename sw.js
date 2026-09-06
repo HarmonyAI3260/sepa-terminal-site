@@ -3,7 +3,11 @@
 
 const SCOPE = new URL(self.registration.scope);
 const CACHE_PREFIX = `sepa-terminal:${encodeURIComponent(SCOPE.pathname)}:`;
-const CACHE_NAME = CACHE_PREFIX + "c834f477fc92-855e18b72a42";
+// One cache per build id: a snapshot cached by an earlier build can never be served
+// beside this build's pages, whatever the app-shell digest says.
+const BUILD_ID = "10fb8dfa0c0d";
+const BUILD_PREFIX = `${CACHE_PREFIX}${BUILD_ID}:`;
+const CACHE_NAME = BUILD_PREFIX + "7d78138aeb81-dd0b438e7990";
 const APP_SHELL = ["./", "index.html", "site.css", "site.js", "screener.js", "manifest.webmanifest", "privacy.html", "offline.html", "404.html", "icons/icon-192.png", "icons/icon-512.png", "icons/maskable-192.png", "icons/maskable-512.png", "icons/apple-touch-icon.png", "icons/feature-graphic.png"];
 const SHELL_URLS = new Set(APP_SHELL.map(path => new URL(path, SCOPE).href));
 const OFFLINE_URL = new URL("offline.html", SCOPE).href;
@@ -21,7 +25,9 @@ self.addEventListener("install", event => {
 self.addEventListener("activate", event => {
   event.waitUntil((async () => {
     const names = await caches.keys();
-    await Promise.all(names.filter(name => name.startsWith(CACHE_PREFIX) && name !== CACHE_NAME)
+    await Promise.all(names
+      .filter(name => name.startsWith(CACHE_PREFIX) &&
+        (!name.startsWith(BUILD_PREFIX) || name !== CACHE_NAME))
       .map(name => caches.delete(name)));
     await self.clients.claim();
   })());

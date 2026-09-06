@@ -9,6 +9,10 @@ const Screener = (() => {
     code33Lite: "2 of 3 in the latest quarter: EPS YoY ≥20 %, sales YoY ≥20 %, margin ≥ year-ago",
   };
   const filtersVersion = 2;
+  // Published identity of this shared filter/verdict/CSV contract. Bump it when a
+  // predicate, column or verdict meaning changes; the build manifest records it so a
+  // page and a snapshot can never claim to agree while their rules differ.
+  const SCREENER_CONTRACT_VERSION = "screener-contract-1.0";
   const defaults = {
     tier: "8/8", rs: 70, stages: ["2"], turnover: null, includeUnknownRs: false,
     inBase: false, nearPivot: false, breakout: false, forming: false,
@@ -218,6 +222,7 @@ const Screener = (() => {
     }
     return lines.join("\n") + "\n";
   }
-  return { readyExplanation, predicateLabels, filtersVersion, defaults, normalize, preset, activePreset, forSnapshot, availability, financialOn, financialVerdict, financialEvaluated, usableFund, coverage,
+  return { readyExplanation, predicateLabels, filtersVersion,
+    contractVersion: SCREENER_CONTRACT_VERSION, defaults, normalize, preset, activePreset, forSnapshot, availability, financialOn, financialVerdict, financialEvaluated, usableFund, coverage,
     financialCoverage, coverageText, matches, distance, distanceText, displayedPivot, monthDelta, eventText, legMarkers, description, csvCell, csv };
 })();

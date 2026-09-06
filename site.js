@@ -22,6 +22,31 @@ function siteUrl(path) {
 
 const REFRESH_OWNER = "sepa_refresh_owner";
 
+// One atomic build: the page, the screener JSON and every series carry the same
+// build id. A mixed pair is shown, never silently rendered as if it agreed.
+let buildMismatch = null;
+
+function checkBuildId(dataBuildId, priceDate) {
+  const page = String(document.documentElement.dataset.buildId || "");
+  const data = String(dataBuildId || "");
+  if (!page || !data || page === data) return false;
+  buildMismatch = { data, page, priceDate: priceDate || null };
+  const banner = $("build-mismatch");
+  if (banner) {
+    banner.hidden = false;
+    banner.textContent = `Data build ${data} \u2260 page build ${page} \u2014 reload to get matching versions.`
+      + (priceDate ? ` The loaded data prices ${priceDate}.` : " The loaded data has no price date.");
+  }
+  for (const id of ["scan-export-tv", "scan-export-csv"]) {
+    const control = $(id);
+    if (control) {
+      control.disabled = true;
+      control.title = `Exports are disabled: data build ${data} does not match page build ${page}`;
+    }
+  }
+  return true;
+}
+
 function initRefresh() {
   // The refresh console lives on the trigger's origin; the site only links to it.
   // Visitors don't see the link: it appears when the page is opened at #refresh
@@ -306,8 +331,9 @@ function renderRows(resetPage = true) {
     header.setAttribute("aria-sort", active ? filters.sortDir === "asc" ? "ascending" : "descending" : "none");
     header.textContent = header.dataset.label + (active ? filters.sortDir === "asc" ? " ↑" : " ↓" : "");
   });
-  $("scan-export-tv").disabled = !visibleRows.length;
-  $("scan-export-csv").disabled = !visibleRows.length && !blocked.length;
+  $("scan-export-tv").disabled = !visibleRows.length || !!buildMismatch;
+  $("scan-export-csv").disabled = (!visibleRows.length && !blocked.length) || !!buildMismatch;
+  if (buildMismatch) checkBuildId(buildMismatch.data, buildMismatch.priceDate);
 }
 
 function downloadText(filename, text, type) {
@@ -323,6 +349,7 @@ function downloadText(filename, text, type) {
 }
 
 function exportCsv() {
+  if (buildMismatch) return;
   downloadText("sepa-screener.csv", Screener.csv(visibleRows, filters, scanData?.meta || {}, Screener.availability(filters, scanData).blocked), "text/csv;charset=utf-8");
 }
 
@@ -362,7 +389,7 @@ function bindScreener() {
       filters.sortKey = key; saveFilters(); renderRows();
     }));
   $("scan-export-tv").addEventListener("click", () => {
-    if (!visibleRows.length || !Screener.availability(filters, scanData).evaluable) return;
+    if (buildMismatch || !visibleRows.length || !Screener.availability(filters, scanData).evaluable) return;
     downloadText("sepa-tradingview-watchlist.txt", visibleRows.map((row) => `NSE:${row.symbol}`).join(","), "text/plain;charset=utf-8");
   });
   $("scan-export-csv").addEventListener("click", exportCsv);
@@ -380,6 +407,7 @@ function loadScreener() {
       const data = await response.json();
       if (!Array.isArray(data?.rows)) throw new Error("Snapshot has no row list");
       scanData = data;
+      checkBuildId(data?.meta?.build_id, data?.meta?.as_of);
       filters = Screener.forSnapshot(filters, scanData);
       saveFilters();
       if (!turnoverWasSaved) {
@@ -463,6 +491,7 @@ async function initStock() {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const series = await response.json();
     bars = Array.isArray(series) ? series : series.bars;
+    checkBuildId(series.build_id, Array.isArray(bars) && bars.length ? bars[bars.length - 1][0] : null);
     if (series.note) {
       const note = document.createElement("p");
       note.className = "fineprint"; note.textContent = series.note;
