@@ -325,6 +325,12 @@ button.secondary:hover { border-color: var(--blue); color: var(--blue); }
 .quarter-table thead tr:first-child th:first-child { text-align: left; }
 .empty-cell { padding: var(--s5) !important; color: var(--muted); text-align: center !important; }
 .seasonal-note { margin: var(--s2) 0 0; color: var(--amber); font: .67rem var(--mono); }
+.fin-chart { margin: 0 0 var(--s4); }
+.fin-chart svg { display: block; width: 100%; height: auto; border: 1px solid var(--border); border-radius: 8px; background: #0b0f14; }
+.fin-chart figcaption { margin-top: 6px; color: var(--muted); font: .65rem var(--mono); }
+.fin-chart .chart-png { color: var(--accent, inherit); }
+.archived-illustration { margin: var(--s4) 0 0; }
+.archived-illustration summary { cursor: pointer; color: var(--muted); font: .68rem var(--mono); }
 .brief-image-wrap { margin: var(--s4) 0 0; }
 .brief-image { display: block; width: min(100%, 1200px); max-height: 760px; margin: 0 auto; object-fit: contain; border: 1px solid var(--border); border-radius: 8px; }
 .brief-image-wrap figcaption { margin-top: 5px; color: var(--muted); font: .65rem var(--mono); text-align: center; }
@@ -420,3 +426,9 @@ footer { padding: var(--s5) 0 0; color: var(--faint); font: .68rem var(--mono); 
 /* A saved restriction stays editable while its input is unavailable. */
 input.blocked { outline: 2px solid #c78b35; outline-offset: 2px; }
 #scan-count button { margin-left: .6rem; }
+
+.claim-list .claim { display: block; }
+.claim-badge { display: inline-block; margin-left: 6px; padding: 0 6px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); font: .6rem var(--mono); text-transform: uppercase; }
+.claim-source { display: block; margin-top: 2px; color: var(--muted); font: .65rem var(--mono); }
+.claim-unverified { opacity: .62; }
+.facts-unverified { margin-left: 8px; padding: 0 6px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); font: .6rem var(--mono); text-transform: uppercase; }

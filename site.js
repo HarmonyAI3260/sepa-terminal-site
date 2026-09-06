@@ -97,6 +97,7 @@ function rankDelta(value) {
 
 function renderFilterControls() {
   $("scan-ready").title = Screener.readyExplanation;
+  $("scan-accelerating").title = Screener.predicateLabels.accelerating;
   document.querySelectorAll(".playbook-presets button[data-preset]").forEach((button) =>
     button.classList.toggle("active", Screener.activePreset(filters, button.dataset.preset, scanData?.meta || {})));
   document.querySelectorAll("#scan-tier button[data-tier]").forEach((button) =>
@@ -118,7 +119,10 @@ function renderFilterControls() {
   [["scan-proper-vcp", "properVcp"], ["scan-ready", "ready"], ["scan-forming", "forming"],
     ["scan-current-only", "currentOnly"], ["scan-unknown-rs", "includeUnknownRs"]].forEach(([id, key]) => $(id).checked = Boolean(filters[key]));
   $("scan-min-history").value = filters.minHistory ?? "";
-  document.querySelectorAll('input[name="scan-growth"]').forEach(input => input.checked = input.value === filters.growthMode);
+  document.querySelectorAll('input[name="scan-growth"]').forEach(input => {
+    input.checked = input.value === filters.growthMode;
+    if (input.value === "code33") input.title = Screener.predicateLabels.code33Lite;
+  });
   renderCoverage();
   $("scan-new").checked = Boolean(filters.isNew);
   $("scan-rs-line-nh").checked = Boolean(filters.rsLineNh);
@@ -184,7 +188,7 @@ function fundHtml(fund) {
   if (fund && !Screener.usableFund({fund})) return `<span class="muted" title="${esc(`financial history ends ${fund.period_end || fund.latest_period || 'unknown'} — not current`)}">${esc(fund.status || 'unknown')}</span>`;
   if (!fund) return '<span class="muted">–</span>';
   const value = (number) => number === null || number === undefined ? "–" : `${number > 0 ? "+" : ""}${fmt(number, 0)}%`;
-  const star = fund.code33_lite === true ? '<span class="fund-star" title="Code 33 (lite: 2 of 3); legacy financial screen">★</span>' : "";
+  const star = fund.code33_lite === true ? `<span class="fund-star" title="${esc(`Code 33-lite: ${Screener.predicateLabels.code33Lite}`)}">★</span>` : "";
   return `<span title="${esc(`Financial period ${fund.period_end || fund.latest_period || "–"} · ${fund.status || "unknown"}`)}">S${value(fund.sales_yoy)}·P${value(fund.pat_yoy)}${star}</span>`;
 }
 
@@ -193,7 +197,8 @@ function sepaHtml(sepa) {
   const dots = Object.keys(SEPA_LABELS).map((key) => {
     const item = sepa[key] || {};
     const state = item.ok === true ? "pass" : item.ok === false ? "fail" : "unknown";
-    return `<span class="scan-dot ${state}" title="${esc(`${SEPA_LABELS[key]}: ${item.text || "–"}`)}"></span>`;
+    const detail = item.title ? ` — ${item.title}` : "";
+    return `<span class="scan-dot ${state}" title="${esc(`${SEPA_LABELS[key]}: ${item.text || "–"}${detail}`)}"></span>`;
   }).join("");
   return `<b>${fmt(sepa.score, 0)}/5</b><span class="sepa-dots">${dots}</span>`;
 }

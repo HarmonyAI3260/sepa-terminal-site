@@ -2,6 +2,13 @@
 "use strict";
 const Screener = (() => {
   const readyExplanation = "Ready = trend + active pattern + entry (near/triggered) + risk ≤ 8% + financial gate. Catalyst is informational; unknown when the memo is historical or missing.";
+  // Every acceleration-flavoured screen names its own predicate: an abbreviated
+  // "acc" must never look like the full three-way Code 33 test.
+  const predicateLabels = {
+    accelerating: "sales YoY and PAT YoY both rising over the last three contiguous quarters (AND)",
+    code33Lite: "2 of 3 in the latest quarter: EPS YoY ≥20 %, sales YoY ≥20 %, margin ≥ year-ago",
+  };
+  const filtersVersion = 2;
   const defaults = {
     tier: "8/8", rs: 70, stages: ["2"], turnover: null, includeUnknownRs: false,
     inBase: false, nearPivot: false, breakout: false, forming: false,
@@ -29,6 +36,9 @@ const Screener = (() => {
     if (!["asc", "desc"].includes(state.sortDir)) state.sortDir = "desc";
     if (state.rs === null) state.rs = 0;
     state.query = state.query.trim();
+    // No predicate meaning changed in this round, so a v1 state migrates unchanged;
+    // the stamp is the hook that lets a future meaning change fail closed instead.
+    state.filtersVersion = filtersVersion;
     return state;
   }
   function preset(name, meta = {}) {
@@ -93,7 +103,8 @@ const Screener = (() => {
     if (state.accelerating) {
       const sales = boolean(fund.sales_acc3), pat = boolean(fund.pat_acc3);
       requested.push(sales, pat);
-      result = and([result, sales === null || pat === null ? null : sales && pat]);
+      // false AND unknown is a definite failure; completeness stays separate.
+      result = and([result, and([sales, pat])]);
     }
     if (state.ready) {
       const ready = boolean(row.qualification?.fund_ok);
@@ -207,6 +218,6 @@ const Screener = (() => {
     }
     return lines.join("\n") + "\n";
   }
-  return { readyExplanation, defaults, normalize, preset, activePreset, forSnapshot, availability, financialOn, financialVerdict, financialEvaluated, usableFund, coverage,
+  return { readyExplanation, predicateLabels, filtersVersion, defaults, normalize, preset, activePreset, forSnapshot, availability, financialOn, financialVerdict, financialEvaluated, usableFund, coverage,
     financialCoverage, coverageText, matches, distance, distanceText, displayedPivot, monthDelta, eventText, legMarkers, description, csvCell, csv };
 })();
