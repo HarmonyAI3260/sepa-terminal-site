@@ -73,6 +73,20 @@ let scanPage = 0;
 let scanLoadPromise = null;
 let turnoverWasSaved = false;
 let filters = loadFilters();
+// SPEC-AF §5: the six grouped categories compose with the shared screener contract.
+const CATEGORY_KEY = "sepa_screener_categories";
+let categories = loadCategories();
+
+function loadCategories() {
+  try {
+    return ScreenFilters.normalize(JSON.parse(localStorage.getItem(CATEGORY_KEY) || "null"));
+  } catch { return ScreenFilters.defaults(); }
+}
+
+function saveCategories() {
+  try { localStorage.setItem(CATEGORY_KEY, JSON.stringify(ScreenFilters.normalize(categories))); }
+  catch { /* private mode: the filters still apply for this session */ }
+}
 
 function loadFilters() {
   let saved = {};
@@ -185,7 +199,9 @@ function compareValues(a, b, direction) {
 
 function filteredRows() {
   if (!Screener.availability(filters, scanData).evaluable) return [];
-  const rows = (scanData?.rows || []).filter(row => Screener.matches(row, filters, scanData?.meta || {}));
+  if (!ScreenFilters.availability(categories, scanData).evaluable) return [];
+  const rows = (scanData?.rows || []).filter(row =>
+    Screener.matches(row, filters, scanData?.meta || {}) && ScreenFilters.matches(row, categories));
   const key = filters.sortKey;
   return rows.sort((a, b) => {
     let result = compareValues(sortValue(a, key), sortValue(b, key), filters.sortDir);
@@ -261,12 +277,15 @@ function renderCoverage() {
     if (missing) control.title = `${missing.reason}. ${control.title}`;
   }
   $("scan-coverage").textContent = `RS-line NH: ${coverage.rsKnown} known / ${coverage.total} (${coverage.rsUsable} current) · RS Δ1m ${Screener.monthDelta({}, scanData?.meta || {})}`;
+  const categoryLine = $("category-coverage");
+  if (categoryLine) categoryLine.textContent = ScreenFilters.coverageText(scanData?.rows || [], categories, scanData);
 }
 
 function renderRows(resetPage = true) {
   if (!scanData) { loadScreener(); return; }
   visibleRows = filteredRows();
-  const blocked = Screener.availability(filters, scanData).blocked;
+  const blocked = [...Screener.availability(filters, scanData).blocked,
+    ...ScreenFilters.availability(categories, scanData).blocked];
   const blockedText = blocked.map(item => item.reason).join("; ");
   if (resetPage) scanPage = 0;
   const pages = Math.max(1, Math.ceil(visibleRows.length / PAGE_SIZE));
@@ -436,6 +455,7 @@ function loadScreener() {
 function initScreener() {
   bindScreener();
   renderFilterControls();
+  initCategories();
   $("scan-load").addEventListener("click", loadScreener);
   document.querySelectorAll("[data-preset-jump]").forEach((button) => button.addEventListener("click", () => {
     const key = button.dataset.presetJump;
@@ -502,6 +522,19 @@ function readListParams() {
 
 async function loadListContext(symbol) {
   const requested = readListParams();
+  // "my:<id>" is one of the reader's own lists: it lives in this browser, not in the
+  // published snapshot, so it is read from the store instead of fetched.
+  if (String(requested.id).startsWith("my:")) {
+    const list = MyLists.get(lists(), String(requested.id).slice(3));
+    if (list) {
+      const context = MSChart.listContext({ id: requested.id, title: list.title,
+        symbols: list.items.map((item) => item.symbol), index: requested.index }, symbol);
+      context.fallback = false;
+      return context;
+    }
+    return { id: null, title: null, symbols: [], index: -1, position: null, fallback: true,
+      error: `${requested.id} is not a list in this browser` };
+  }
   try {
     const payload = await fetchJson(`/data/lists/${requested.id}.json`);
     const context = MSChart.listContext(
@@ -607,6 +640,7 @@ async function initStock() {
     return;
   }
   const symbol = String(config.symbol || "");
+  initStockActions(config);
   const context = await loadListContext(symbol);
   renderListNav(context);
   const move = bindListNavigation(context);
@@ -936,11 +970,27 @@ async function initStock() {
 function initSidebar() {
   const toggle = $("sidebar-toggle");
   const body = $("sidebar-body");
+  const aside = $("site-sidebar");
   if (!toggle || !body) return;
-  toggle.addEventListener("click", () => {
-    const open = body.classList.toggle("open");
+  let open = false;
+  let scrim = null;
+  const setOpen = (next) => {
+    open = next;
+    body.classList.toggle("open", open);
+    aside?.classList.toggle("open", open);
     toggle.setAttribute("aria-expanded", String(open));
-  });
+    if (open && !scrim) {
+      scrim = document.createElement("div");
+      scrim.className = "sidebar-scrim";
+      scrim.addEventListener("click", () => setOpen(false));
+      document.body.appendChild(scrim);
+    } else if (!open && scrim) {
+      scrim.remove();
+      scrim = null;
+    }
+  };
+  toggle.addEventListener("click", () => setOpen(!open));
+  window.addEventListener("keydown", (event) => { if (event.key === "Escape" && open) setOpen(false); });
 }
 
 async function initList() {
@@ -983,8 +1033,8 @@ async function initList() {
         return `<td><a class="list-symbol" href="${esc(href)}">${esc(row.symbol)}</a></td>`;
       }
       return `<td>${esc(Lists.formatCell(row, key, extrasFor(row)))}</td>`;
-    }).join("")}</tr>`).join("");
-    return `<div class="detail-table-wrap"><table class="detail-table list-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+    }).join("")}<td class="row-actions-cell">${listActionsHtml(row.symbol)}</td></tr>`).join("");
+    return `<div class="detail-table-wrap"><table class="detail-table list-table"><thead><tr>${head}<th aria-label="My Lists"></th></tr></thead><tbody>${body}</tbody></table></div>`;
   }
 
   function renderCards(rows) {
@@ -998,7 +1048,7 @@ async function initList() {
       return `<article class="list-card"><a href="${esc(href)}"><header><b>${esc(card.symbol)}</b><small>${esc(card.name)}</small></header>
         ${spark}
         <div class="list-card-price"><b>${esc(card.close)}</b><span class="${esc(card.changeClass)}">${esc(card.change)}</span></div>
-        <dl>${card.ratings.map((entry) => `<div><dt>${esc(entry.label)}</dt><dd>${esc(entry.value)}</dd></div>`).join("")}</dl></a></article>`;
+        <dl>${card.ratings.map((entry) => `<div><dt>${esc(entry.label)}</dt><dd>${esc(entry.value)}</dd></div>`).join("")}</dl></a>${listActionsHtml(card.symbol)}</article>`;
     }).join("")}</div>`;
   }
 
@@ -1015,6 +1065,7 @@ async function initList() {
       button.setAttribute("aria-pressed", String(button.dataset.listView === view)));
   }
 
+  bindListActions(target, draw);
   select?.addEventListener("change", () => { sortKey = select.value; pageIndex = 1; draw(); });
   document.querySelectorAll("[data-list-view]").forEach((button) => button.addEventListener("click", () => {
     view = button.dataset.listView; pageIndex = 1; draw();
@@ -1025,12 +1076,404 @@ async function initList() {
   draw();
 }
 
+
+/* ── §5 Build Your Screen: the six categories and saved named screens ─────── */
+function renderCategoryControls() {
+  const host = $("filter-category-body");
+  if (!host) return;
+  const state = ScreenFilters.normalize(categories);
+  host.innerHTML = ScreenFilters.categoriesHtml(state);
+  const summary = $("filter-category-summary");
+  if (summary) {
+    const active = ScreenFilters.active(state);
+    summary.textContent = active.length
+      ? `${active.length} active: ${ScreenFilters.describe(state)}` : "no category filter is active";
+  }
+}
+
+function readCategoryControls() {
+  return ScreenFilters.readControls([...document.querySelectorAll("#filter-category-body [data-filter]")]);
+}
+
+function applyCategoryState(state) {
+  categories = ScreenFilters.normalize(state);
+  saveCategories();
+  renderCategoryControls();
+  if (scanData) { renderCoverage(); renderRows(); }
+}
+
+function renderSavedScreens(selected) {
+  const select = $("saved-screens");
+  if (!select) return;
+  const document_ = ScreenFilters.loadSaved(localStorage);
+  select.innerHTML = ['<option value="">— saved screens —</option>',
+    ...document_.screens.map((screen) =>
+      `<option value="${esc(screen.name)}"${screen.name === selected ? " selected" : ""}>${esc(screen.name)}</option>`)].join("");
+}
+
+function initCategories() {
+  const host = $("filter-category-body");
+  if (!host) return;
+  renderCategoryControls();
+  renderSavedScreens();
+  host.addEventListener("change", () => applyCategoryState(readCategoryControls()));
+  $("category-clear")?.addEventListener("click", () => applyCategoryState({}));
+  $("saved-apply")?.addEventListener("click", () => {
+    const screen = ScreenFilters.getScreen(localStorage, $("saved-screens").value);
+    if (!screen) return;
+    if (screen.screener) { filters = Screener.normalize(screen.screener); saveFilters(); renderFilterControls(); }
+    applyCategoryState(screen.filters);
+  });
+  $("saved-save")?.addEventListener("click", () => {
+    const name = window.prompt("Name this screen", $("saved-screens").value || "My screen");
+    if (!name) return;
+    const result = ScreenFilters.saveScreen(localStorage, name, categories, Screener.normalize(filters));
+    if (!result.ok) { window.alert(result.error); return; }
+    renderSavedScreens(String(name).trim().slice(0, 60));
+  });
+  $("saved-delete")?.addEventListener("click", () => {
+    const name = $("saved-screens").value;
+    if (!name) return;
+    ScreenFilters.deleteScreen(localStorage, name);
+    renderSavedScreens();
+  });
+}
+
+/* ── §2 My Lists: the browser-local store behind every list control ───────── */
+let myLists = null;
+
+function lists() {
+  if (myLists === null) myLists = MyLists.load(localStorage);
+  return myLists;
+}
+
+function persistLists() {
+  MyLists.save(localStorage, myLists);
+  renderSidebarCounts();
+}
+
+function renderSidebarCounts() {
+  const counts = MyLists.counts(lists());
+  const portfolio = MyLists.holdings(lists()).length;
+  document.querySelectorAll("[data-mylist-count]").forEach((node) => {
+    const id = node.dataset.mylistCount;
+    const value = id === "model-current-holdings" ? portfolio
+      : id === "model-sell-watchlist" ? portfolio
+      : id === "my-lists" ? Object.values(counts).reduce((total, count) => total + count, 0)
+      : id === "model-buy-watchlist" ? counts.favorites || 0 : null;
+    node.textContent = value === null ? "" : String(value);
+  });
+}
+
+function listActionsHtml(symbol) {
+  const store = lists();
+  const state = (id) => (MyLists.has(store, id, symbol) ? ' aria-pressed="true"' : ' aria-pressed="false"');
+  return `<span class="row-actions" data-symbol="${esc(symbol)}">`
+    + `<button type="button" data-list-action="favorites"${state("favorites")} title="Favorite">★</button>`
+    + `<button type="button" data-list-action="liked"${state("liked")} title="Like">▲</button>`
+    + `<button type="button" data-list-action="disliked"${state("disliked")} title="Dislike">▼</button>`
+    + `<button type="button" data-list-action="add" title="Add to a list of your own">+</button>`
+    + `</span>`;
+}
+
+function bindListActions(container, redraw) {
+  container?.addEventListener("click", (event) => {
+    const button = event.target?.closest?.("[data-list-action]");
+    if (!button) return;
+    event.preventDefault();
+    const symbol = button.parentElement?.dataset?.symbol || button.dataset.symbol;
+    const action = button.dataset.listAction;
+    if (!symbol) return;
+    if (action === "liked" || action === "disliked") MyLists.opinion(lists(), symbol, action);
+    else if (action === "add") {
+      const named = MyLists.listsOf(lists()).filter((list) => !list.builtin).map((list) => list.title);
+      const answer = window.prompt(`Add ${symbol} to which list?`, named[0] || "Watchlist");
+      if (!answer) return;
+      const existing = MyLists.listsOf(lists()).find((list) => list.title === answer);
+      MyLists.add(lists(), existing ? existing.id : MyLists.createList(lists(), answer),
+        { symbol }, { title: answer, kind: "custom" });
+    } else MyLists.toggle(lists(), "favorites", { symbol });
+    persistLists();
+    if (typeof redraw === "function") redraw();
+  });
+}
+
+function initStockActions(payload) {
+  const host = $("stock-actions");
+  if (!host) return;
+  const symbol = String(payload.symbol || host.dataset.symbol || "");
+  const status = $("action-status");
+  const store = lists();
+  MyLists.touchRecent(store, symbol);
+  persistLists();
+  const refresh = () => {
+    for (const [id, list] of [["action-favorite", "favorites"], ["action-like", "liked"],
+      ["action-dislike", "disliked"]]) {
+      const button = $(id);
+      if (button) button.setAttribute("aria-pressed", String(MyLists.has(lists(), list, symbol)));
+    }
+  };
+  const announce = (text) => { if (status) status.textContent = text; };
+  $("action-favorite")?.addEventListener("click", () => {
+    MyLists.toggle(lists(), "favorites", { symbol });
+    persistLists(); refresh();
+    announce(MyLists.has(lists(), "favorites", symbol) ? `${symbol} added to Favorite Stocks` : `${symbol} removed from Favorite Stocks`);
+  });
+  for (const [id, verdict] of [["action-like", "liked"], ["action-dislike", "disliked"]]) {
+    $(id)?.addEventListener("click", () => {
+      MyLists.opinion(lists(), symbol, verdict);
+      persistLists(); refresh();
+      announce(MyLists.has(lists(), verdict, symbol) ? `${symbol} marked ${verdict}` : `${symbol} cleared`);
+    });
+  }
+  $("action-add")?.addEventListener("click", () => {
+    const named = MyLists.listsOf(lists()).filter((list) => !list.builtin).map((list) => list.title);
+    const answer = window.prompt(`Add ${symbol} to which list?${named.length ? ` Existing: ${named.join(", ")}` : ""}`, named[0] || "Watchlist");
+    if (!answer) return;
+    const existing = MyLists.listsOf(lists()).find((list) => list.title === answer);
+    const id = existing ? existing.id : MyLists.createList(lists(), answer);
+    MyLists.add(lists(), id, { symbol }, { title: answer, kind: "custom" });
+    persistLists();
+    announce(`${symbol} added to ${answer}`);
+  });
+  $("action-position")?.addEventListener("click", () => {
+    const quantity = window.prompt(`Quantity of ${symbol}`, "");
+    if (quantity === null) return;
+    const price = window.prompt(`Average price paid for ${symbol}`, "");
+    if (price === null) return;
+    const date = window.prompt("Entry date (YYYY-MM-DD, optional)", new Date().toISOString().slice(0, 10));
+    const pattern = (payload.qualification || {}).pattern || {};
+    MyLists.add(lists(), "portfolio", { symbol }, { kind: "portfolio", title: "My Portfolio" });
+    MyLists.updateHolding(lists(), symbol, {
+      qty: quantity, avg_price: price, entry_date: date,
+      entry_pivot: pattern.pivot, entry_stop: pattern.stop, entry_buy_high: pattern.buy_zone_high,
+    });
+    persistLists();
+    announce(`${symbol} recorded in My Portfolio (${quantity} @ ${price})`);
+  });
+  refresh();
+}
+
+/* ── §3 / §4 the browser-local pages ─────────────────────────────────────── */
+const portfolioView = Portfolio.renderers({ esc, fmt, signed, cls, url: siteUrl,
+  contextUrl: (listId, symbol, index) =>
+    `${siteUrl(`/s/${symbol}.html`)}?list=${encodeURIComponent(`my:${listId}`)}&i=${index}` });
+
+async function initUserPage() {
+  const host = $("user-render");
+  const configNode = $("user-config");
+  if (!host || !configNode) return;
+  let config = {};
+  try { config = JSON.parse(configNode.textContent); } catch { config = {}; }
+  const store = lists();
+  renderSidebarCounts();
+
+  if (config.id === "my-lists") {
+    const draw = () => { host.innerHTML = portfolioView.myLists(MyLists.listsOf(lists())); };
+    draw();
+    host.addEventListener("click", (event) => {
+      const target = event.target;
+      if (target?.dataset?.removeSymbol) {
+        MyLists.remove(lists(), target.dataset.removeList, target.dataset.removeSymbol);
+        persistLists(); draw(); return;
+      }
+      if (target?.dataset?.deleteList) {
+        MyLists.deleteList(lists(), target.dataset.deleteList);
+        persistLists(); draw(); return;
+      }
+      if (target?.dataset?.exportList) {
+        const id = target.dataset.exportList;
+        downloadText(`${id}.csv`, MyLists.exportCsv(lists(), id), "text/csv;charset=utf-8");
+      }
+    });
+    host.addEventListener("change", async (event) => {
+      const input = event.target;
+      if (!input?.dataset?.importList || !input.files?.length) return;
+      const text = await input.files[0].text();
+      const result = MyLists.importCsv(lists(), input.dataset.importList, text);
+      persistLists(); draw();
+      const status = $("mylists-status");
+      if (status) status.textContent = result.ok
+        ? `Imported ${result.imported} rows (${result.skipped} skipped).` : `Import failed: ${result.error}`;
+    });
+    $("mylists-export")?.addEventListener("click", () =>
+      downloadText("sepa-my-lists.json", MyLists.exportJson(lists()), "application/json"));
+    $("mylists-import")?.addEventListener("change", async (event) => {
+      const file = event.target.files?.[0];
+      if (!file) return;
+      const result = MyLists.importJson(lists(), await file.text());
+      const status = $("mylists-status");
+      if (result.ok) { myLists = result.store; persistLists(); draw(); }
+      if (status) status.textContent = result.ok
+        ? `Merged ${result.lists} lists (${result.added >= 0 ? "+" : ""}${result.added} rows).`
+        : `Import failed: ${result.error}`;
+    });
+    $("mylists-new")?.addEventListener("click", () => {
+      const title = window.prompt("Name the new list", "Watchlist");
+      if (!title) return;
+      MyLists.createList(lists(), title);
+      persistLists(); draw();
+    });
+    $("mylists-sync")?.addEventListener("click", async () => {
+      const status = $("mylists-status");
+      try {
+        // Same-origin only: the published site has no API, so this succeeds exactly when
+        // the bundle is being served by the local app.
+        const remote = await fetchJson("/api/lists");
+        myLists = MyLists.merge(lists(), remote);
+        persistLists();
+        const put = await fetch(siteUrl("/api/lists"), { method: "PUT",
+          headers: { "content-type": "application/json" }, body: JSON.stringify(myLists) });
+        if (!put.ok) throw new Error(`HTTP ${put.status}`);
+        draw();
+        if (status) status.textContent = "Synced with the local app.";
+      } catch (error) {
+        if (status) status.textContent = `Sync is only available when this page is served by the local SEPA Terminal app (${esc(error.message)}).`;
+      }
+    });
+    return;
+  }
+
+  host.innerHTML = '<p class="list-empty">Loading the published snapshot…</p>';
+  let rows = [];
+  try {
+    const payload = await fetchJson(config.screenerPath || "/data/screener.json");
+    checkBuildId(payload.build_id || payload.meta?.build_id, payload.meta?.as_of);
+    rows = payload.rows || [];
+  } catch (error) {
+    host.innerHTML = `<p class="list-empty negative">The published snapshot could not be loaded (${esc(error.message)}), so nothing can be valued.</p>`;
+    return;
+  }
+  const byId = Portfolio.index(rows);
+
+  if (config.id === "model-current-holdings") {
+    host.innerHTML = portfolioView.holdingsTable(Portfolio.currentHoldings(MyLists.holdings(store), byId));
+    return;
+  }
+  if (config.id === "model-sell-watchlist") {
+    const cards = Portfolio.sellWatchlist(MyLists.holdings(store), byId);
+    host.innerHTML = cards.length ? portfolioView.holdingsTable(cards)
+      : '<p class="list-empty">No holding breaches a sell rule in this snapshot.</p>';
+    return;
+  }
+  if (config.id === "model-buy-watchlist") {
+    let systemSymbols = [];
+    if (config.systemListPath) {
+      try { systemSymbols = (await fetchJson(config.systemListPath)).symbols || []; } catch { systemSymbols = []; }
+    }
+    host.innerHTML = portfolioView.buyWatchlistTable(
+      Portfolio.buyWatchlist(MyLists.symbols(store, "favorites"), byId, systemSymbols));
+    return;
+  }
+  if (config.id === "portfolio-evaluation") {
+    const status = $("evaluation-status");
+    const render = (holdings, note) => {
+      const result = Portfolio.evaluate(holdings, byId, { asOf: config.as_of });
+      host.innerHTML = portfolioView.evaluation(result);
+      if (status) status.textContent = note || "";
+      return result;
+    };
+    const fromText = () => {
+      const parsed = Portfolio.parseHoldings($("evaluation-input").value, MyLists.parseCsv);
+      return render(parsed.items, parsed.errors.length
+        ? `${parsed.items.length} positions read; ${parsed.errors.length} line(s) skipped: ${parsed.errors.map((error) => `line ${error.line}`).join(", ")}`
+        : `${parsed.items.length} positions read.`);
+    };
+    $("evaluation-run")?.addEventListener("click", fromText);
+    $("evaluation-portfolio")?.addEventListener("click", () => {
+      const holdings = MyLists.holdings(lists());
+      render(holdings, holdings.length ? `Evaluated ${holdings.length} positions from My Portfolio.`
+        : "My Portfolio has no position with both a quantity and an average price.");
+    });
+    $("evaluation-file")?.addEventListener("change", async (event) => {
+      const file = event.target.files?.[0];
+      if (!file) return;
+      $("evaluation-input").value = await file.text();
+      fromText();
+    });
+    const holdings = MyLists.holdings(store);
+    render(holdings, holdings.length ? `Evaluated ${holdings.length} positions from My Portfolio.`
+      : "Paste holdings above, upload a CSV, or record positions on a stock page.");
+  }
+}
+
+/* ── §6 Markets → Bulk & Block Deals: a client-side filter over the table ─── */
+function initDeals() {
+  const input = $("deals-filter");
+  const table = $("deals-table");
+  if (!input || !table) return;
+  const rows = [...(table.querySelectorAll?.("tbody tr") || [])];
+  const count = $("deals-count");
+  const apply = () => {
+    const needle = input.value.trim().toLowerCase();
+    let shown = 0;
+    for (const row of rows) {
+      const match = !needle || row.textContent.toLowerCase().includes(needle);
+      row.hidden = !match;
+      if (match) shown += 1;
+    }
+    if (count) count.textContent = `${shown} of ${rows.length} shown`;
+  };
+  input.addEventListener("input", apply);
+  apply();
+}
+
+/* ── §7 polish: theme, keyboard help, mobile drawer ───────────────────────── */
+const THEME_KEY = "sepa_theme";
+
+function applyTheme(theme) {
+  const root = document.documentElement;
+  if (root.dataset) root.dataset.theme = theme;
+  const button = $("theme-toggle");
+  if (button) {
+    button.setAttribute("aria-pressed", String(theme === "light"));
+    button.textContent = theme === "light" ? "Light" : "Dark";
+  }
+}
+
+function initTheme() {
+  let saved = null;
+  try { saved = localStorage.getItem(THEME_KEY); } catch { saved = null; }
+  applyTheme(saved === "light" ? "light" : "dark");
+  $("theme-toggle")?.addEventListener("click", () => {
+    const next = (document.documentElement.dataset || {}).theme === "light" ? "dark" : "light";
+    applyTheme(next);
+    try { localStorage.setItem(THEME_KEY, next); } catch { /* private mode */ }
+  });
+}
+
+function toggleKeyHelp(open) {
+  const overlay = $("key-help");
+  if (!overlay) return;
+  overlay.hidden = open === undefined ? !overlay.hidden : !open;
+}
+
+function initKeyHelp() {
+  $("help-open")?.addEventListener("click", () => toggleKeyHelp());
+  $("help-close")?.addEventListener("click", () => toggleKeyHelp(false));
+  window.addEventListener("keydown", (event) => {
+    const tag = String(event.target?.tagName || "").toLowerCase();
+    if (["input", "textarea", "select"].includes(tag) || event.target?.isContentEditable) return;
+    if (event.key === "?" && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      event.preventDefault();
+      toggleKeyHelp();
+    } else if (event.key === "Escape") {
+      toggleKeyHelp(false);
+    }
+  });
+}
+
 initRefresh();
 initNavigation();
 initSidebar();
+initTheme();
+initKeyHelp();
+renderSidebarCounts();
 if (document.body.dataset.page === "screener") initScreener();
 if (document.body.dataset.page === "stock") initStock();
 if (document.body.dataset.page === "list") initList();
+if (document.body.dataset.page === "user") initUserPage();
+if (document.body.dataset.page === "markets") initDeals();
 
 // Progressive web app: keeps the last snapshot readable offline and satisfies the
 // installability criteria the Android wrapper (Trusted Web Activity) expects.

@@ -10,9 +10,10 @@ const Lists = (() => {
   const LISTS_CONTRACT_VERSION = "lists-contract-1.0";
   const PAGE_SIZE = 50;
   const PERCENT_COLUMNS = new Set(["chg_pct", "off_high", "pct_from_pivot", "pct_to_pivot",
-    "eps_yoy", "dividend_yield", "rs_line_drawdown"]);
+    "eps_yoy", "dividend_yield", "rs_line_drawdown", "risk_pct"]);
   const SIGNED_COLUMNS = new Set(["chg_pct", "off_high", "group_rank_change"]);
   const RUPEE_COLUMNS = new Set(["market_cap_cr", "avg_rupee_volume_cr"]);
+  const PRICE_COLUMNS = new Set(["close", "pivot", "buy_limit", "stop"]);
   const INTEGER_COLUMNS = new Set(["composite", "eps_rating", "rs_rating", "group_rank", "tt"]);
   const TEXT_COLUMNS = new Set(["symbol", "name", "group", "base_status", "stage", "entry_state",
     "ad_rating", "included_in", "surveillance", "last_date"]);
@@ -55,6 +56,10 @@ const Lists = (() => {
       case "rs_line_drawdown": return facts.rs_line_drawdown_pct;
       case "last_date": return row.last_date;
       case "included_in": return (extras.included_in || []).join(", ") || null;
+      case "pivot": return (qualification.pattern || {}).pivot;
+      case "buy_limit": return (qualification.pattern || {}).buy_zone_high;
+      case "stop": return (qualification.pattern || {}).stop;
+      case "risk_pct": return (qualification.pattern || {}).risk_pct;
       default: return null;
     }
   }
@@ -68,7 +73,7 @@ const Lists = (() => {
     const sign = SIGNED_COLUMNS.has(key) && number > 0 ? "+" : "";
     if (PERCENT_COLUMNS.has(key)) return `${sign}${number.toFixed(1)}%`;
     if (RUPEE_COLUMNS.has(key)) return `₹${number.toLocaleString("en-IN", { maximumFractionDigits: 0 })}`;
-    if (key === "close") return `₹${number.toFixed(2)}`;
+    if (PRICE_COLUMNS.has(key)) return `₹${number.toFixed(2)}`;
     if (INTEGER_COLUMNS.has(key)) return String(Math.round(number));
     return `${sign}${number.toFixed(2)}`;
   }
