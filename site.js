@@ -243,7 +243,7 @@ function renderRows(resetPage = true) {
   const ready = (scanData.rows || []).filter((row) => row.qualification?.ready === true).length;
   $("scan-count").textContent = `Universe ${fmt(meta.universe_total, 0)} · scanned ${fmt(meta.scanned, 0)} · 8/8: ${fmt(eight, 0)} · ready: ${fmt(ready, 0)} · shown: ${fmt(visibleRows.length, 0)}`;
   renderFilterControls();
-  $("scan-count").textContent += ` · Financial criteria evaluated for ${visibleRows.filter(row => Screener.financialEvaluated(row, filters)).length} of ${visibleRows.length} rows`;
+  $("scan-count").textContent += ` · ${Screener.coverageText(scanData, filters)}`;
   $("scan-results-body").innerHTML = pageRows.map((row) => {
     const base = row.base || {};
     const dots = (row.tt?.checks || []).map((check) => {
@@ -449,7 +449,7 @@ async function initStock() {
     container.innerHTML = '<div class="chart-loading muted">Chart library unavailable. Technical tables and snapshot figures remain available.</div>';
     return;
   }
-  container.innerHTML = '<div class="chart-host"></div><div class="buy-zone-band" aria-hidden="true"><span>+5% buy zone</span></div>';
+  container.innerHTML = '<div class="chart-host"></div><div class="buy-zone-band" aria-hidden="true"><span>Risk-approved entry band</span></div>';
   const host = container.querySelector(".chart-host");
   const band = container.querySelector(".buy-zone-band");
   const chart = LightweightCharts.createChart(host, {
@@ -478,19 +478,20 @@ async function initStock() {
   const pattern = config.qualification?.pattern || {};
   const pivot = pattern.id ? pattern.pivot : null;
   if (Number.isFinite(pivot)) candles.createPriceLine({ price: pivot, color: "#2ee6a8", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "pivot" });
+  if (pattern.id && Number.isFinite(pattern.extension_limit)) candles.createPriceLine({ price: pattern.extension_limit, color: "#f5a623", lineWidth: 1, lineStyle: 2, title: "5% extension limit" });
   const reference = config.reference_pattern?.pivot ?? (!pattern.id ? config.geometry_pivot : null);
   if (Number.isFinite(reference)) candles.createPriceLine({ price: reference, color: "#f5a623", lineWidth: 1, lineStyle: 2, title: config.reference_pattern ? "power play · flag forming" : "geometry pivot" });
   candles.setMarkers(Screener.legMarkers(config.reference_pattern ? [] : config.legs, bars.map(bar => bar[0])));
   const stop = pattern.id ? pattern.stop : null;
   if (Number.isFinite(stop)) candles.createPriceLine({ price: stop, color: "#ef5350", lineWidth: 1, lineStyle: 1, axisLabelVisible: true, title: "stop" });
   const positionBand = () => {
-    if (!Number.isFinite(pivot)) { band.hidden = true; return; }
+    if (!Number.isFinite(pivot) || !Number.isFinite(pattern.buy_zone_high) || pattern.buy_zone_high <= pivot) { band.hidden = true; return; }
     const upper = candles.priceToCoordinate(pattern.buy_zone_high);
     const lower = candles.priceToCoordinate(pivot);
     if (upper === null || lower === null) { band.hidden = true; return; }
     band.hidden = false;
     band.style.top = `${Math.min(upper, lower)}px`;
-    band.style.height = `${Math.max(2, Math.abs(lower - upper))}px`;
+    band.style.height = `${Math.abs(lower - upper)}px`;
   };
   chart.timeScale().fitContent();
   chart.timeScale().subscribeVisibleLogicalRangeChange(positionBand);

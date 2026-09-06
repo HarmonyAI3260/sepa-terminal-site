@@ -281,7 +281,7 @@ button.secondary:hover { border-color: var(--blue); color: var(--blue); }
 #chart { position: relative; width: 100%; min-height: 440px; overflow: hidden; border-top: 1px solid var(--border-soft); }
 .chart-host { position: absolute; inset: 0; z-index: 1; }
 .chart-loading { display: grid; min-height: 440px; place-items: center; color: var(--muted); font: .75rem var(--mono); }
-.buy-zone-band { position: absolute; right: 72px; left: 0; z-index: 2; min-height: 2px; pointer-events: none; border-top: 1px solid rgba(46, 230, 168, .45); border-bottom: 1px solid rgba(46, 230, 168, .45); background: rgba(46, 230, 168, .075); }
+.buy-zone-band { position: absolute; right: 72px; left: 0; z-index: 2; pointer-events: none; border-top: 1px solid rgba(46, 230, 168, .45); border-bottom: 1px solid rgba(46, 230, 168, .45); background: rgba(46, 230, 168, .075); }
 .buy-zone-band span { position: absolute; top: 2px; left: 6px; color: rgba(46, 230, 168, .78); font: 500 .58rem var(--mono); }
 .chart-legend { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--s3); color: var(--muted); font: .62rem var(--mono); }
 .chart-legend span::before { display: inline-block; width: 13px; height: 2px; margin-right: 4px; vertical-align: middle; content: ""; background: currentColor; }
@@ -412,3 +412,7 @@ footer { padding: var(--s5) 0 0; color: var(--faint); font: .68rem var(--mono); 
 .scan-growth label { white-space:nowrap; }
 .filter-toggle:has(input:disabled) { opacity:.6; cursor:help; }
 .leg-evidence { grid-column:1 / -1; overflow-x:auto; }
+/* Saved narrative is never a current entry headline after dependency drift. */
+.memo-banner { padding: 12px; border: 1px solid #b38644; border-radius: 6px; color: #e5ba77; }
+.historical-memo { margin: 16px 0; }
+.historical-memo summary { cursor: pointer; }

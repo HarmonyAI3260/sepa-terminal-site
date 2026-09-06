@@ -68,16 +68,30 @@ const Screener = (() => {
     if (!usableFund(row)) return false;
     const fund = row.fund;
     if (state.ready) return row.qualification?.fund_ok !== null && row.qualification?.fund_ok !== undefined;
-    const predicates = [[state.salesYoy, fund.sales_yoy], [state.patYoy, fund.pat_yoy]]
-      .filter(([threshold]) => finite(threshold))
-      .map(([threshold, value]) => finite(value) ? value >= threshold : null);
-    const thresholds = predicates.includes(false) ? false : predicates.every(value => value === true) ? true : null;
-    const code = typeof fund.code33_lite === "boolean" ? fund.code33_lite : null;
-    const growth = state.growthMode === "thresholds" ? thresholds !== null
-      : state.growthMode === "code33" || !predicates.length ? code !== null
-      : thresholds === true || code === true || (thresholds === false && code === false);
-    return growth && (!state.accelerating || typeof fund.sales_acc3 === "boolean" || typeof fund.pat_acc3 === "boolean");
+    // Completeness depends on requested fields, never on threshold values or
+    // an AND/OR short circuit; unknown coverage is stable while editing cutoffs.
+    const thresholds = (!finite(state.salesYoy) || finite(fund.sales_yoy))
+      && (!finite(state.patYoy) || finite(fund.pat_yoy));
+    const code = typeof fund.code33_lite === "boolean";
+    const growth = state.growthMode === "thresholds" ? thresholds
+      : state.growthMode === "code33" ? code : thresholds && code;
+    return growth && (!state.accelerating || (typeof fund.sales_acc3 === "boolean" && typeof fund.pat_acc3 === "boolean"));
   }
+  function financialCoverage(data, state) {
+    const candidates = (data?.rows || []).filter(row => matches(row, state, data?.meta || {}, true));
+    const evaluated = candidates.filter(row => financialEvaluated(row, state));
+    const noRecord = candidates.filter(row => !usableFund(row)).length;
+    const passed = evaluated.filter(row => matches(row, state, data?.meta || {})).length;
+    return { candidates: candidates.length, evaluated: evaluated.length, passed,
+      failed: evaluated.length - passed, unknown: candidates.length - evaluated.length,
+      noRecord, growthUnavailable: candidates.length - evaluated.length - noRecord,
+      global: (data?.rows || []).filter(usableFund).length, total: (data?.rows || []).length };
+  }
+  function coverageText(data, state) {
+    const c = financialCoverage(data, state);
+    return `candidates ${c.candidates} · evaluated ${c.evaluated} (passed ${c.passed}, failed ${c.failed}) · unknown ${c.unknown} (no financial record ${c.noRecord}, required growth % unavailable ${c.growthUnavailable}) · global coverage ${c.global.toLocaleString("en-US")} of ${c.total.toLocaleString("en-US")}`;
+  }
+
   function coverage(data) {
     const rows = data?.rows || [], asOf = data?.meta?.as_of;
     const known = rows.filter(row => typeof row.rs_line_nh === "boolean");
@@ -85,7 +99,7 @@ const Screener = (() => {
     return { rsKnown: known.length, rsUsable: usable.length, total: rows.length,
       previous: !!data?.meta?.prev_as_of && data.meta.prev_as_of !== asOf };
   }
-  function matches(row, state, meta = {}) {
+  function matches(row, state, meta = {}, nonFinancialOnly = false) {
     const passed = row.tt?.passed;
     const tierOk = state.tier === "All" || state.tier === "8/8" && passed === 8
       || state.tier === "≥7" && passed >= 7 || state.tier === "≥6" && passed >= 6;
@@ -110,9 +124,12 @@ const Screener = (() => {
       && (!statuses.length || statuses.includes(row.base?.status))
       && (!(state.tightening || state.properVcp) || row.base?.vcp_trend_qualified === true)
       && (!state.recentBreakout || row.qualification?.entry_state === "triggered")
-      && (!state.ready || row.qualification?.ready === true)
+      && (!state.ready || (nonFinancialOnly
+        ? row.qualification?.trend_ok === true && !!row.qualification?.pattern?.id
+          && ["near", "triggered"].includes(row.qualification?.entry_state) && row.qualification?.risk_ok === true
+        : row.qualification?.ready === true))
       && (!state.powerPlay || row.power_play?.flag === true)
-      && growthOk && (!state.accelerating || usableFund(row) && (fund.sales_acc3 === true || fund.pat_acc3 === true))
+      && (nonFinancialOnly || growthOk && (!state.accelerating || usableFund(row) && (fund.sales_acc3 === true || fund.pat_acc3 === true)))
       && (!state.isNew || !!meta.prev_as_of && meta.prev_as_of !== meta.as_of && row.new_since_prev === true)
       && (!state.rsLineNh || row.rs_line_nh === true && row.stale !== true && (!meta.as_of || row.last_date === meta.as_of));
   }
@@ -164,5 +181,5 @@ const Screener = (() => {
     return lines.join("\n") + "\n";
   }
   return { defaults, normalize, preset, activePreset, forSnapshot, financialOn, financialEvaluated, usableFund, coverage,
-    matches, distance, distanceText, displayedPivot, monthDelta, eventText, legMarkers, description, csvCell, csv };
+    financialCoverage, coverageText, matches, distance, distanceText, displayedPivot, monthDelta, eventText, legMarkers, description, csvCell, csv };
 })();
