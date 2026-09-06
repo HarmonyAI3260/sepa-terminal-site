@@ -3,7 +3,7 @@
 
 const SCOPE = new URL(self.registration.scope);
 const CACHE_PREFIX = `sepa-terminal:${encodeURIComponent(SCOPE.pathname)}:`;
-const CACHE_NAME = CACHE_PREFIX + "e895a3cfdbaf-9e014afc8464";
+const CACHE_NAME = CACHE_PREFIX + "0f142990bbf9-4155358ff055";
 const APP_SHELL = ["./", "index.html", "site.css", "site.js", "screener.js", "manifest.webmanifest", "privacy.html", "offline.html", "404.html", "icons/icon-192.png", "icons/icon-512.png", "icons/maskable-192.png", "icons/maskable-512.png", "icons/apple-touch-icon.png", "icons/feature-graphic.png"];
 const SHELL_URLS = new Set(APP_SHELL.map(path => new URL(path, SCOPE).href));
 const OFFLINE_URL = new URL("offline.html", SCOPE).href;

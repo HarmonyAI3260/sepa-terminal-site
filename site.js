@@ -96,6 +96,7 @@ function rankDelta(value) {
 }
 
 function renderFilterControls() {
+  $("scan-ready").title = Screener.readyExplanation;
   document.querySelectorAll(".playbook-presets button[data-preset]").forEach((button) =>
     button.classList.toggle("active", Screener.activePreset(filters, button.dataset.preset, scanData?.meta || {})));
   document.querySelectorAll("#scan-tier button[data-tier]").forEach((button) =>
@@ -154,6 +155,7 @@ function compareValues(a, b, direction) {
 }
 
 function filteredRows() {
+  if (!Screener.availability(filters, scanData).evaluable) return [];
   const rows = (scanData?.rows || []).filter(row => Screener.matches(row, filters, scanData?.meta || {}));
   const key = filters.sortKey;
   return rows.sort((a, b) => {
@@ -217,17 +219,25 @@ function pivotDisplay(row) {
 
 function renderCoverage() {
   const coverage = Screener.coverage(scanData);
+  const blocked = Screener.availability(filters, scanData).blocked;
   const rs = $("scan-rs-line-nh"), fresh = $("scan-new");
-  rs.disabled = !coverage.rsUsable;
+  rs.disabled = !coverage.rsUsable && !filters.rsLineNh;
   rs.title = `RS-line NH: ${coverage.rsKnown} known of ${coverage.total}; ${coverage.rsUsable} at snapshot date`;
-  fresh.disabled = !coverage.previous;
+  fresh.disabled = !coverage.previous && !filters.isNew;
   fresh.title = coverage.previous ? `Compared with ${scanData.meta.prev_as_of}` : "New needs a previous distinct price session";
+  for (const [control, key] of [[rs, "rsLineNh"], [fresh, "isNew"]]) {
+    const missing = blocked.find(item => item.key === key);
+    control.classList.toggle("blocked", !!missing);
+    if (missing) control.title = `${missing.reason}. ${control.title}`;
+  }
   $("scan-coverage").textContent = `RS-line NH: ${coverage.rsKnown} known / ${coverage.total} (${coverage.rsUsable} current) · RS Δ1m ${Screener.monthDelta({}, scanData?.meta || {})}`;
 }
 
 function renderRows(resetPage = true) {
   if (!scanData) { loadScreener(); return; }
   visibleRows = filteredRows();
+  const blocked = Screener.availability(filters, scanData).blocked;
+  const blockedText = blocked.map(item => item.reason).join("; ");
   if (resetPage) scanPage = 0;
   const pages = Math.max(1, Math.ceil(visibleRows.length / PAGE_SIZE));
   scanPage = Math.max(0, Math.min(scanPage, pages - 1));
@@ -235,7 +245,7 @@ function renderRows(resetPage = true) {
   const pageRows = visibleRows.slice(first, first + PAGE_SIZE);
   $("scan-page-status").textContent = visibleRows.length
     ? `Rows ${first + 1}–${first + pageRows.length} of ${visibleRows.length} · page ${scanPage + 1}/${pages}`
-    : "0 matching rows";
+    : blocked.length ? `0 rows · blocked: ${blockedText}` : "0 matching rows";
   $("scan-prev").disabled = scanPage === 0;
   $("scan-next").disabled = scanPage >= pages - 1;
   const meta = scanData.meta || {};
@@ -244,6 +254,19 @@ function renderRows(resetPage = true) {
   $("scan-count").textContent = `Universe ${fmt(meta.universe_total, 0)} · scanned ${fmt(meta.scanned, 0)} · 8/8: ${fmt(eight, 0)} · ready: ${fmt(ready, 0)} · shown: ${fmt(visibleRows.length, 0)}`;
   renderFilterControls();
   $("scan-count").textContent += ` · ${Screener.coverageText(scanData, filters)}`;
+  if (blocked.length) {
+    $("scan-count").textContent = `0 rows · blocked: ${blockedText}`;
+    for (const item of blocked) {
+      const button = document.createElement("button");
+      button.id = `scan-remove-${item.key}`;
+      button.type = "button"; button.textContent = "Remove condition";
+      button.title = `Remove ${item.label}`;
+      button.addEventListener("click", () => { filters[item.key] = false; saveFilters(); renderRows(); });
+      $("scan-count").appendChild(button);
+    }
+  } else if (!visibleRows.length) {
+    $("scan-count").textContent = `0 matching rows · ${Screener.coverageText(scanData, filters)}`;
+  }
   $("scan-results-body").innerHTML = pageRows.map((row) => {
     const base = row.base || {};
     const dots = (row.tt?.checks || []).map((check) => {
@@ -271,6 +294,7 @@ function renderRows(resetPage = true) {
       <td><a class="scan-tv" href="https://in.tradingview.com/chart/?symbol=NSE%3A${encodeURIComponent(symbol)}" target="_blank" rel="noopener noreferrer" title="Open TradingView" aria-label="Open ${esc(symbol)} in TradingView">↗</a></td>
     </tr>`;
   }).join("") || '<tr><td colspan="14" class="scan-no-results"><b>No rows match the active filters.</b><span>Reset the playbook or broaden one of the thresholds.</span></td></tr>';
+  if (blocked.length) $("scan-results-body").innerHTML = `<tr><td colspan="14" class="scan-no-results">Screen blocked: ${esc(blockedText)}</td></tr>`;
   document.querySelectorAll("#scan-results th[data-sort]").forEach((header) => {
     const active = header.dataset.sort === filters.sortKey;
     header.classList.toggle("sort-active", active);
@@ -278,7 +302,7 @@ function renderRows(resetPage = true) {
     header.textContent = header.dataset.label + (active ? filters.sortDir === "asc" ? " ↑" : " ↓" : "");
   });
   $("scan-export-tv").disabled = !visibleRows.length;
-  $("scan-export-csv").disabled = !visibleRows.length;
+  $("scan-export-csv").disabled = !visibleRows.length && !blocked.length;
 }
 
 function downloadText(filename, text, type) {
@@ -294,7 +318,7 @@ function downloadText(filename, text, type) {
 }
 
 function exportCsv() {
-  downloadText("sepa-screener.csv", Screener.csv(visibleRows, filters, scanData?.meta || {}), "text/csv;charset=utf-8");
+  downloadText("sepa-screener.csv", Screener.csv(visibleRows, filters, scanData?.meta || {}, Screener.availability(filters, scanData).blocked), "text/csv;charset=utf-8");
 }
 
 function bindScreener() {
@@ -332,8 +356,10 @@ function bindScreener() {
       filters.sortDir = filters.sortKey === key ? filters.sortDir === "asc" ? "desc" : "asc" : key === "symbol" ? "asc" : "desc";
       filters.sortKey = key; saveFilters(); renderRows();
     }));
-  $("scan-export-tv").addEventListener("click", () => downloadText(
-    "sepa-tradingview-watchlist.txt", visibleRows.map((row) => `NSE:${row.symbol}`).join(","), "text/plain;charset=utf-8"));
+  $("scan-export-tv").addEventListener("click", () => {
+    if (!visibleRows.length || !Screener.availability(filters, scanData).evaluable) return;
+    downloadText("sepa-tradingview-watchlist.txt", visibleRows.map((row) => `NSE:${row.symbol}`).join(","), "text/plain;charset=utf-8");
+  });
   $("scan-export-csv").addEventListener("click", exportCsv);
 }
 

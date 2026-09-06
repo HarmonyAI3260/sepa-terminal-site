@@ -416,3 +416,7 @@ footer { padding: var(--s5) 0 0; color: var(--faint); font: .68rem var(--mono); 
 .memo-banner { padding: 12px; border: 1px solid #b38644; border-radius: 6px; color: #e5ba77; }
 .historical-memo { margin: 16px 0; }
 .historical-memo summary { cursor: pointer; }
+
+/* A saved restriction stays editable while its input is unavailable. */
+input.blocked { outline: 2px solid #c78b35; outline-offset: 2px; }
+#scan-count button { margin-left: .6rem; }
