@@ -107,6 +107,33 @@ const Lists = (() => {
     };
   }
 
+  /* Why this symbol is in this list, from what the list JSON already carries — never a
+     sentence invented here (SPEC-AJ §1.3):
+       · the screens that put it there, when the list publishes an ``included_in`` map
+         (Stocks to Watch is the union of the other screens);
+       · ``rank n of N`` for an industry-group list, which is an ordered membership;
+       · the entry state for Actionable Buys, which is the reason the row qualifies;
+       · otherwise the list's own rule sentence (``description``), trimmed to one line.
+     A list with none of those returns null, and the panel simply shows no reason. */
+  function membershipReason(payload, row) {
+    const source = payload || {};
+    const symbol = String((row && row.symbol) || row || "");
+    const included = (source.included_in || {})[symbol] || [];
+    if (included.length) return included.map((title) => String(title)).join(", ");
+    const group = source.group || null;
+    if (group && group.name) {
+      const order = (source.symbols || []).map(String).indexOf(symbol);
+      const total = (source.symbols || []).length;
+      return order === -1 ? `member of ${group.name}` : `rank ${order + 1} of ${total}`;
+    }
+    const state = ((row || {}).qualification || {}).entry_state;
+    if (String(source.id || "") === "actionable-buys" && state) {
+      return `entry state: ${String(state).replace(/_/g, " ")}`;
+    }
+    const description = String(source.description || "").trim();
+    return description ? description.split(/(?<=\.)\s/)[0] : null;
+  }
+
   function compare(a, b, direction) {
     const missingA = a === null || a === undefined || a === "";
     const missingB = b === null || b === undefined || b === "";
@@ -253,6 +280,7 @@ const Lists = (() => {
   return {
     contractVersion: LISTS_CONTRACT_VERSION, PAGE_SIZE, cellValue, formatCell, compare, sortRows,
     defaultDirection, sortOptions, sparkPath, cardModel, csvCell, csv, csvColumns, page,
+    membershipReason,
     COMPOSITE_PARTIAL_MARK, COMPOSITE_PARTIAL_TITLE, compositeBasis, compositeCell,
     pageOf, stockHref, listLink,
   };

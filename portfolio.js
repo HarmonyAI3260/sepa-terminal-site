@@ -954,13 +954,28 @@ const Portfolio = (() => {
     /* ``lists`` is MyLists.listsOf(store): the module boundary stays one-way. */
     function myLists(lists) {
       return (lists || []).map((list) => {
-        const rows = (list.items || []).map((item, index) => `<tr><td>${contextLink(list.id, item.symbol, index)}</td>
+        // The Reviewed list is a record of decisions, not of positions: it shows the
+        // decision word, the note, the date it was saved and the list being read
+        // (SPEC-AJ §1.5), instead of quantity and average price.
+        const review = list.kind === "review";
+        const rows = (list.items || []).map((item, index) => (review
+          ? `<tr><td>${contextLink(list.id, item.symbol, index)}</td>
+          <td><b class="review-decision review-${esc(item.decision || "none")}">${esc(item.decision || "–")}</b></td>
+          <td>${esc(String(item.reviewed_at || item.added_at || "").slice(0, 10) || "–")}</td>
+          <td>${esc((item.context || {}).list || "–")}</td>
+          <td>${esc(item.note || "")}</td>
+          <td><button type="button" data-remove-list="${esc(list.id)}" data-remove-symbol="${esc(item.symbol)}">remove</button></td>
+          </tr>`
+          : `<tr><td>${contextLink(list.id, item.symbol, index)}</td>
           <td>${item.qty === undefined ? "–" : fmt(item.qty, 0)}</td>
           <td>${item.avg_price === undefined ? "–" : money(item.avg_price)}</td>
           <td>${esc(item.entry_date || String(item.added_at || "").slice(0, 10) || "–")}</td>
           <td>${esc(item.note || "")}</td>
           <td><button type="button" data-remove-list="${esc(list.id)}" data-remove-symbol="${esc(item.symbol)}">remove</button></td>
-          </tr>`).join("");
+          </tr>`)).join("");
+        const headers = review
+          ? "<th>Symbol</th><th>Decision</th><th>Reviewed</th><th>From list</th><th>Note</th><th></th>"
+          : "<th>Symbol</th><th>Qty</th><th>Avg price</th><th>Date</th><th>Note</th><th></th>";
         return `<section class="card user-list" data-list="${esc(list.id)}">
           <div class="card-head"><div><span class="eyebrow">${esc(list.builtin ? list.kind : "custom")}</span>
             <h2>${esc(list.title)} <small>${list.count}</small></h2></div>
@@ -971,7 +986,7 @@ const Portfolio = (() => {
             </div></div>
           ${list.description ? `<p class="fineprint">${esc(list.description)}</p>` : ""}
           ${list.count ? `<div class="detail-table-wrap"><table class="detail-table"><thead><tr>
-            <th>Symbol</th><th>Qty</th><th>Avg price</th><th>Date</th><th>Note</th><th></th></tr></thead>
+            ${headers}</tr></thead>
             <tbody>${rows}</tbody></table></div>` : `<p class="list-empty">This list is empty.</p>`}
           </section>`;
       }).join("");

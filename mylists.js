@@ -27,6 +27,9 @@ const MyLists = (() => {
       description: "The last 100 stock pages you opened in this browser." },
     { id: "liked", title: "Liked", kind: "opinion", description: "Names you marked with a thumbs up." },
     { id: "disliked", title: "Disliked", kind: "opinion", description: "Names you marked with a thumbs down." },
+    { id: "reviewed", title: "Reviewed", kind: "review",
+      description: "Stocks you reviewed and the decision you saved, with the note, the date "
+        + "and the list you were reading at the time." },
   ];
   const BUILTIN_IDS = new Set(BUILTIN.map((entry) => entry.id));
   const KINDS = new Set([...BUILTIN.map((entry) => entry.kind), "custom"]);
@@ -36,7 +39,11 @@ const MyLists = (() => {
   const HOLDING_FIELDS = ["qty", "avg_price", "entry_pivot", "entry_stop", "entry_buy_high"];
   const NUMERIC_FIELDS = ["qty", "avg_price", "entry_pivot", "entry_stop", "entry_buy_high"];
   const CSV_COLUMNS = ["symbol", "qty", "avg_price", "entry_date", "entry_pivot", "entry_stop",
-    "entry_buy_high", "note", "added_at"];
+    "entry_buy_high", "note", "added_at", "decision", "reviewed_at", "context_list",
+    "context_build_id"];
+  /* SPEC-AJ §1.5: the three words a saved review may carry. Anything else is not a
+     decision and is refused, so an imported document cannot invent a fourth verdict. */
+  const DECISIONS = ["buy-plan", "watch", "pass"];
 
   const finite = (value) => typeof value === "number" && Number.isFinite(value);
   const number = (value) => {
@@ -78,6 +85,17 @@ const MyLists = (() => {
       }
       const entry = isoDate(raw.entry_date);
       if (entry) item.entry_date = entry;
+      // A saved review decision travels with the item, so an export, a merge and the
+      // local-app sync all carry it without a second document.
+      if (DECISIONS.includes(raw.decision)) item.decision = raw.decision;
+      const reviewed = isoDate(raw.reviewed_at) || (raw.reviewed_at ? String(raw.reviewed_at) : null);
+      if (item.decision && reviewed) item.reviewed_at = String(raw.reviewed_at);
+      if (item.decision && raw.context && typeof raw.context === "object") {
+        item.context = {
+          list: raw.context.list ? String(raw.context.list).slice(0, 60) : null,
+          build_id: raw.context.build_id ? String(raw.context.build_id).slice(0, 40) : null,
+        };
+      }
     }
     return item;
   }
@@ -256,6 +274,39 @@ const MyLists = (() => {
     return item;
   }
 
+  /* ── saved review decisions (SPEC-AJ §1.5) ────────────────────────────────
+     One review per symbol: saving again replaces the previous decision rather than
+     stacking a second opinion, and the date is the moment it was saved. Nothing leaves
+     the browser — the local app's /api/lists sync carries the same document. */
+  function review(store, symbol, { decision, note = null, context = null } = {}) {
+    const wanted = symbolOf(symbol);
+    if (!wanted || !DECISIONS.includes(decision)) return null;
+    const list = ensure(store, "reviewed", "Reviewed", "review");
+    list.items = list.items.filter((item) => item.symbol !== wanted);
+    const item = normalizeItem({
+      symbol: wanted, decision, note, reviewed_at: now(), added_at: now(),
+      context: context && typeof context === "object"
+        ? { list: context.list ?? null, build_id: context.build_id ?? null } : null,
+    });
+    list.items.unshift(item);
+    list.items = list.items.slice(0, ITEM_LIMIT);
+    list.updated_at = now();
+    return item;
+  }
+
+  function reviewOf(store, symbol) {
+    const wanted = symbolOf(symbol);
+    return (get(store, "reviewed")?.items || []).find((item) => item.symbol === wanted) || null;
+  }
+
+  /* "Reviewed · watch · 2026-09-07" — one sentence, used by the stock page, the list
+     panel and the My Lists table so they cannot word the same record differently. */
+  function reviewLabel(item) {
+    if (!item || !item.decision) return null;
+    const date = String(item.reviewed_at || "").slice(0, 10);
+    return `Reviewed · ${item.decision}${date ? ` · ${date}` : ""}`;
+  }
+
   /* Positions only: a My Portfolio row without a quantity is a watch item. */
   function holdings(store) {
     return (get(store, "portfolio")?.items || [])
@@ -299,8 +350,10 @@ const MyLists = (() => {
     const list = get(store, id);
     const header = [`# ${list ? list.title : id} · ${(list?.items || []).length} rows`,
       `# exported ${now()} · ${MYLISTS_CONTRACT_VERSION}`, CSV_COLUMNS.join(",")];
+    const cell = (item, key) => (key === "context_list" ? (item.context || {}).list
+      : key === "context_build_id" ? (item.context || {}).build_id : item[key]);
     const lines = (list?.items || []).map((item) =>
-      CSV_COLUMNS.map((key) => csvCell(item[key] ?? "")).join(","));
+      CSV_COLUMNS.map((key) => csvCell(cell(item, key) ?? "")).join(","));
     return `${[...header, ...lines].join("\n")}\n`;
   }
 
@@ -406,8 +459,9 @@ const MyLists = (() => {
 
   return {
     contractVersion: MYLISTS_CONTRACT_VERSION, STORAGE_KEY, VERSION, RECENT_LIMIT, BUILTIN,
-    CSV_COLUMNS, emptyStore, normalize, load, save, listsOf, get, has, add, remove, toggle,
+    CSV_COLUMNS, DECISIONS, emptyStore, normalize, load, save, listsOf, get, has, add, remove, toggle,
     opinion, touchRecent, createList, renameList, deleteList, updateHolding, holdings, symbols,
+    review, reviewOf, reviewLabel,
     exportJson, importJson, exportCsv, importCsv, parseCsv, csvCell, merge, mergeItems, counts,
     slug, symbolOf,
   };

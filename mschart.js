@@ -19,6 +19,45 @@ const MSChart = (() => {
   const MA_STORAGE_KEY = "sepa_ma_periods";
   const MA_COLORS = ["#4da3ff", "#f5a623", "#d678ff", "#2ee6a8"];
   const RS_LOOKBACK = { D: 252, W: 52, M: 12 };
+  /* Every overlay the reader may switch off, in the order the toolbar renders them
+     (SPEC-AJ §1.1). Display only: a hidden overlay changes nothing about the row it
+     came from — no screening predicate, readiness rule, rating or gate reads this. */
+  const OVERLAY_STORAGE_KEY = "sepa_overlays";
+  const OVERLAYS = [
+    { id: "base_band", label: "Base boundaries", default: true },
+    { id: "legs", label: "Contraction legs", default: true },
+    { id: "rs_events", label: "RS events", default: true },
+    { id: "pivot", label: "Pivot", default: true },
+    { id: "stop", label: "Stop", default: true },
+    { id: "risk_band", label: "Risk-approved band", default: true },
+    { id: "extension", label: "5 % extension", default: true },
+    { id: "geometry_pivot", label: "Geometry pivot", default: true },
+    { id: "reference_52w", label: "52-week lines", default: true },
+    { id: "rs_line", label: "RS line", default: true },
+    { id: "index", label: "Nifty 50", default: false },
+  ];
+  const OVERLAY_IDS = OVERLAYS.map((entry) => entry.id);
+  /* Scale and window are one stored object, because they are read together on every
+     render and both survive a timeframe switch and the next stock. */
+  const VIEW_STORAGE_KEY = "sepa_chart_view";
+  const SCALES = ["log", "linear"];
+  const WINDOW_PRESETS = [
+    { id: "6M", label: "6M", bars: { D: 126, W: 26, M: 6 } },
+    { id: "1Y", label: "1Y", bars: { D: 252, W: 52, M: 12 } },
+    { id: "2Y", label: "2Y", bars: { D: 504, W: 104, M: 24 } },
+    // "All" is the loaded history: the chart fits its own content, as it always has.
+    { id: "All", label: "All", bars: null },
+  ];
+  const WINDOW_IDS = WINDOW_PRESETS.map((entry) => entry.id);
+  const DEFAULT_VIEW = { scale: "log", window: "All" };
+  /* The volume average drawn beside the bars, per timeframe, and the legend that names
+     it — so the pane never shows an unlabelled line. */
+  const VOLUME_PERIODS = { D: 50, W: 10, M: 10 };
+  const VOLUME_UNITS = { D: "session", W: "week", M: "month" };
+  // The price/volume split: the volume pane gets the bottom 26 % of the pane instead of
+  // the 18 % it had, so a dry-up is legible (SPEC-AJ §1.2).
+  const PRICE_SCALE_MARGINS = { top: 0.06, bottom: 0.28 };
+  const VOLUME_SCALE_MARGINS = { top: 0.74, bottom: 0 };
   const HIT_TOLERANCE = 6;
   const RAY_EXTENSION = 40;   // the renderer and the hit test must agree on one factor
   const finite = (value) => typeof value === "number" && Number.isFinite(value);
@@ -92,6 +131,85 @@ const MSChart = (() => {
     const chosen = (periods || []).slice().sort((left, right) => left - right);
     return chosen.length ? `${chosen.map((period) => `${period}${unit}`).join(" / ")} MA`
       : "no moving average shown";
+  }
+
+  /* ── display preferences: overlays, scale, window (SPEC-AJ §1.1/§1.2) ──────
+     All three are read from ``localStorage`` and normalised here, so a corrupt or
+     hand-edited entry can never do more than fall back to the documented default. */
+  function overlayState(stored) {
+    const source = stored && typeof stored === "object" ? stored : {};
+    const state = {};
+    for (const overlay of OVERLAYS) {
+      state[overlay.id] = typeof source[overlay.id] === "boolean"
+        ? source[overlay.id] : overlay.default;
+    }
+    return state;
+  }
+
+  function overlayStore(stored, id, on) {
+    if (!OVERLAY_IDS.includes(id)) return overlayState(stored);
+    return { ...overlayState(stored), [id]: Boolean(on) };
+  }
+
+  function overlayLabel(id) {
+    return (OVERLAYS.find((entry) => entry.id === id) || {}).label || String(id);
+  }
+
+  function viewState(stored) {
+    const source = stored && typeof stored === "object" ? stored : {};
+    return {
+      scale: SCALES.includes(source.scale) ? source.scale : DEFAULT_VIEW.scale,
+      window: WINDOW_IDS.includes(source.window) ? source.window : DEFAULT_VIEW.window,
+    };
+  }
+
+  function viewStore(stored, patch) {
+    return viewState({ ...viewState(stored), ...(patch && typeof patch === "object" ? patch : {}) });
+  }
+
+  /* How many bars a preset shows on one timeframe: 6M = 126 D / 26 W / 6 M and so on.
+     ``All`` (and any unknown preset) returns null — the caller fits the content. */
+  function windowBars(preset, timeframe) {
+    const entry = WINDOW_PRESETS.find((candidate) => candidate.id === preset);
+    if (!entry || !entry.bars) return null;
+    return entry.bars[timeframe] || null;
+  }
+
+  /* The logical range for ``timeScale().setVisibleLogicalRange``. A window longer than
+     the loaded history is not a window: the whole history is shown instead, so a young
+     listing is never padded with empty space it never traded through. */
+  function windowRange(preset, timeframe, barCount) {
+    const wanted = windowBars(preset, timeframe);
+    const bars = Number(barCount) || 0;
+    if (!wanted || bars <= 0 || wanted >= bars) return null;
+    return { from: bars - wanted, to: bars - 1 };
+  }
+
+  function volumeLegend(timeframe) {
+    const period = VOLUME_PERIODS[timeframe] || VOLUME_PERIODS.D;
+    return `Volume · ${period}-${VOLUME_UNITS[timeframe] || VOLUME_UNITS.D} average`;
+  }
+
+  /* The base as a shaded band: from ``base_start_date`` to the last bar on screen,
+     between ``base_low`` and ``base_high``. Read straight from the published base —
+     nothing here re-derives a base from the bars. */
+  function baseBandModel(band, bars) {
+    const source = band && typeof band === "object" ? band : null;
+    if (!source || !Array.isArray(bars) || !bars.length) return null;
+    // ``numeric`` reads null as 0; a base needs a real high and a real low or no band.
+    const level = (value) => (value === null || value === undefined || value === ""
+      ? null : numeric(value));
+    const high = level(source.high);
+    const low = level(source.low);
+    const start = source.start_date ? String(source.start_date).slice(0, 10) : null;
+    if (high === null || low === null || !start || high <= low) return null;
+    const index = bars.findIndex((bar) => String(bar[0]).slice(0, 10) >= start);
+    if (index === -1) return null;
+    return {
+      start: bars[index][0], end: bars[bars.length - 1][0], high, low,
+      startDate: start, bars: bars.length - index,
+      title: `base ${start} · ₹${low} – ₹${high}`,
+    };
   }
 
   function movingAverage(values, period) {
@@ -717,6 +835,10 @@ const MSChart = (() => {
   return {
     contractVersion: MSCHART_CONTRACT_VERSION, DRAW_TOOLS, TIMEFRAMES, MA_PERIODS, RS_LOOKBACK,
     MA_DEFAULTS, MA_STORAGE_KEY, MA_COLORS, maSelection, maStore, maColor, maLegend,
+    OVERLAYS, OVERLAY_IDS, OVERLAY_STORAGE_KEY, overlayState, overlayStore, overlayLabel,
+    VIEW_STORAGE_KEY, SCALES, WINDOW_PRESETS, WINDOW_IDS, DEFAULT_VIEW, viewState, viewStore,
+    windowBars, windowRange, VOLUME_PERIODS, volumeLegend,
+    PRICE_SCALE_MARGINS, VOLUME_SCALE_MARGINS, baseBandModel,
     isoWeekKey, monthKey, aggregate, movingAverage, rsLine, volumeSeries,
     loadedRange, referenceModel, partialLast, partialLastNote,
     fnv1a12, rsEvents, readTime, normalizeTime, eventMarkers, sortedMarkers, assertSortedMarkers,

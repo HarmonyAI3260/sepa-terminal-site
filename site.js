@@ -250,6 +250,16 @@ function filteredRows() {
   });
 }
 
+/* SPEC-AJ §2.2: the screener payload carries each Trend Template check as {id, pass};
+   the label is published once in meta.tt_labels and the per-check detail sentence travels
+   with the stock page, not with the index. A row from an older snapshot that still
+   carries its own label keeps working. */
+function ttCheckTitle(check, state) {
+  const labels = ((scanData || {}).meta || {}).tt_labels || {};
+  const label = labels[String(check.id)] || check.label || `Trend Template check ${check.id}`;
+  return `${check.id}. ${label} — ${state}`;
+}
+
 function baseText(row) {
   const base = row.base || {};
   const status = baseStatus(base);
@@ -380,7 +390,7 @@ function renderRows(resetPage = true) {
     const base = row.base || {};
     const dots = (row.tt?.checks || []).map((check) => {
       const state = check.pass === true ? "pass" : check.pass === false ? "fail" : "unknown";
-      return `<span class="scan-dot ${state}" title="${esc(`${check.label || ""}: ${check.detail || ""}`)}"></span>`;
+      return `<span class="scan-dot ${state}" title="${esc(ttCheckTitle(check, state))}"></span>`;
     }).join("");
     const newBadge = row.new_since_prev ? '<span class="new-badge">NEW</span>' : "";
     const staleBadge = row.stale === true ? `<span class="stale-badge" title="${esc(`stale — last data ${row.last_date || "unknown"}`)}">●</span>` : "";
@@ -695,6 +705,9 @@ async function loadListContext(symbol) {
       const context = MSChart.listContext({ id: requested.id, title: list.title,
         build_id: pageBuildId(), symbols: list.items.map((item) => item.symbol),
         index: requested.index, sort: requested.sort, pages }, symbol);
+      // A list of the reader's own: the reason is their own note, or simply the list.
+      context.reasons = Object.fromEntries(list.items.map((item) =>
+        [item.symbol, item.note || `in your list ${list.title}`]));
       context.fallback = false;
       rememberListContext(context, requested);
       return context;
@@ -731,6 +744,11 @@ async function loadListContext(symbol) {
         index: requested.index, sort: requested.sort, pages,
         unresolved: payload.missing_symbols || [] },
       symbol);
+    // Why each member is in this list, from the list JSON itself (SPEC-AJ §1.3). The
+    // navigation context is extended, not duplicated: same object, one more field.
+    const rowIndex = new Map(rows.map((row) => [String(row.symbol), row]));
+    context.reasons = Object.fromEntries(context.symbols.map((entry) =>
+      [entry, Lists.membershipReason(payload, rowIndex.get(entry) || { symbol: entry })]));
     context.fallback = requested.fallback;
     rememberListContext(context, requested);
     return context;
@@ -767,6 +785,70 @@ function renderListNav(context) {
   const unresolved = context.unresolvedNote ? ` · ${context.unresolvedNote}` : "";
   label.textContent = (context.position ? `${context.position}${suffix}`
     : `not in ${context.title || context.id}`) + sorted + unresolved;
+}
+
+/* ── the persistent ordered-list panel (SPEC-AJ §1.3) ────────────────────────────
+   On wide viewports the list the reader came from stays on screen as a left column:
+   every member with the reason it is in the list and the marks the reader has put on it.
+   Built from the same context the keyboard walks and the same ``Lists.listLink``, so the
+   panel, the drawer and Space/→ cannot disagree about the order. */
+let activeListContext = null;
+
+function reviewMarkHtml(symbol) {
+  const store = lists();
+  const marks = [];
+  if (MyLists.has(store, "favorites", symbol)) marks.push('<i title="Favorite">★</i>');
+  if (MyLists.has(store, "liked", symbol)) marks.push('<i class="positive" title="Liked">▲</i>');
+  if (MyLists.has(store, "disliked", symbol)) marks.push('<i class="negative" title="Disliked">▼</i>');
+  const review = MyLists.reviewOf(store, symbol);
+  if (review) {
+    marks.push(`<i class="review-mark" title="${esc(MyLists.reviewLabel(review))}">`
+      + `✓ ${esc(review.decision)}</i>`);
+  }
+  return marks.join("");
+}
+
+function renderListPanel(context) {
+  if (context !== undefined) activeListContext = context;
+  const panel = $("list-panel");
+  const state = activeListContext;
+  if (!panel) return;
+  if (!state || !(state.symbols || []).length) {
+    panel.innerHTML = '<p class="fineprint" id="list-panel-status">'
+      + `${esc((state || {}).error || "no list context")}</p>`;
+    return;
+  }
+  const sorted = state.sort ? ` · sorted by ${state.sort.key} ${state.sort.direction}` : "";
+  const position = `${state.position || `not in ${state.title || state.id}`}${sorted}`;
+  const rows = state.symbols.map((symbol, index) => {
+    const reason = (state.reasons || {})[symbol];
+    const href = Lists.listLink(state.id, state.symbols, symbol, basePath(),
+      { sort: state.sort, pages: state.pages });
+    return `<li class="${index === state.index ? "current" : ""}" data-symbol="${esc(symbol)}">`
+      + `<a href="${esc(href)}"><b>${esc(symbol)}</b>`
+      + `<span class="panel-marks">${reviewMarkHtml(symbol)}</span></a>`
+      + (reason ? `<em class="panel-reason">${esc(reason)}</em>` : "")
+      + "</li>";
+  }).join("");
+  panel.innerHTML = `<h3>${esc(state.title || state.id || "List")}</h3>`
+    + `<p class="fineprint" id="list-panel-status">${esc(position)}</p>`
+    + `<ol class="list-panel-rows" start="1">${rows}</ol>`
+    + (state.unresolvedNote ? `<p class="fineprint">${esc(state.unresolvedNote)}</p>` : "");
+  panel.querySelector("li.current")?.scrollIntoView({ block: "center" });
+}
+
+/* The Absolute / YoY % switch on the quarterly block. Display only: both readings are
+   already in the page, so nothing is recomputed and nothing is fetched. */
+function initQuarterlyBlock() {
+  const block = $("quarterly-block");
+  if (!block) return;
+  const buttons = [...document.querySelectorAll("[data-quarterly]")];
+  buttons.forEach((button) => button.addEventListener("click", () => {
+    const mode = button.dataset.quarterly === "yoy" ? "yoy" : "absolute";
+    block.dataset.mode = mode;
+    buttons.forEach((other) =>
+      other.setAttribute("aria-pressed", String(other.dataset.quarterly === mode)));
+  }));
 }
 
 function gotoListEntry(context, result) {
@@ -855,8 +937,10 @@ async function initStock() {
   }
   const symbol = String(config.symbol || "");
   initStockActions(config);
+  initQuarterlyBlock();
   const context = await loadListContext(symbol);
   renderListNav(context);
+  renderListPanel(context);
   const move = bindListNavigation(context);
   const gotoTab = bindTabs();
   setPanel(panelOpen());
@@ -873,6 +957,34 @@ function loadMaPeriods() {
 function saveMaPeriods(store) {
   try { localStorage.setItem(MSChart.MA_STORAGE_KEY, JSON.stringify(store || {})); }
   catch { /* private mode: the selection still applies for this session */ }
+}
+
+/* ── display preferences that survive the next stock (SPEC-AJ §1.1/§1.2/§1.6) ──
+   Overlay switches and the chart view (log/linear + window preset) are read from
+   localStorage on every stock page and written back the moment they change. They are
+   display state and nothing else: no screening predicate, readiness rule, rating or
+   build gate reads these keys — switching an overlay off changes what is drawn, never
+   what the row is. */
+function loadOverlays() {
+  try {
+    return MSChart.overlayState(JSON.parse(localStorage.getItem(MSChart.OVERLAY_STORAGE_KEY) || "null"));
+  } catch { return MSChart.overlayState(null); }
+}
+
+function saveOverlays(state) {
+  try { localStorage.setItem(MSChart.OVERLAY_STORAGE_KEY, JSON.stringify(state || {})); }
+  catch { /* private mode: the switches still apply for this session */ }
+}
+
+function loadChartView() {
+  try {
+    return MSChart.viewState(JSON.parse(localStorage.getItem(MSChart.VIEW_STORAGE_KEY) || "null"));
+  } catch { return MSChart.viewState(null); }
+}
+
+function saveChartView(view) {
+  try { localStorage.setItem(MSChart.VIEW_STORAGE_KEY, JSON.stringify(MSChart.viewState(view))); }
+  catch { /* private mode: the view still applies for this session */ }
 }
 
 /* The chart's frame colours come from the stylesheet's own variables, read at creation
@@ -1010,10 +1122,16 @@ async function initChart(config, context, mount = {}) {
   const host = container.querySelector(".chart-host");
   const overlay = $("draw-overlay");
   const band = container.querySelector(".buy-zone-band");
+  // The reader's overlay switches and chart view, read before the chart exists so the
+  // first paint is already the one they left on the previous stock (SPEC-AJ §1.6).
+  let overlays = loadOverlays();
+  let view = loadChartView();
+  const scaleMode = () => (view.scale === "linear"
+    ? LightweightCharts.PriceScaleMode.Normal : LightweightCharts.PriceScaleMode.Logarithmic);
   const chart = LightweightCharts.createChart(host, {
     ...themedChartOptions(),
     rightPriceScale: { ...themedChartOptions().rightPriceScale,
-      scaleMargins: { top: 0.08, bottom: 0.18 }, mode: LightweightCharts.PriceScaleMode.Logarithmic },
+      scaleMargins: MSChart.PRICE_SCALE_MARGINS, mode: scaleMode() },
     timeScale: { ...themedChartOptions().timeScale, timeVisible: false, rightOffset: 4 },
     crosshair: { ...themedChartOptions().crosshair, mode: LightweightCharts.CrosshairMode.Normal },
     height: Math.max(460, container.clientHeight), autoSize: true,
@@ -1025,7 +1143,9 @@ async function initChart(config, context, mount = {}) {
     borderVisible: false,
   });
   const volume = chart.addHistogramSeries({ priceScaleId: "vol", priceFormat: { type: "volume" } });
-  chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+  // A taller volume pane: the bottom 26 % of the chart instead of 18 %, so a dry-up is
+  // legible beside the price bars (SPEC-AJ §1.2).
+  chart.priceScale("vol").applyOptions({ scaleMargins: MSChart.VOLUME_SCALE_MARGINS });
   const volumeAverage = chart.addLineSeries({ priceScaleId: "vol", color: "#f5a623", lineWidth: 1,
     priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
   // One series per selectable daily average (21/50/150/200); the weekly and monthly sets
@@ -1036,7 +1156,8 @@ async function initChart(config, context, mount = {}) {
     lastValueVisible: false, crosshairMarkerVisible: false });
   const indexSeries = chart.addLineSeries({ color: "#8a97a8", lineWidth: 1, priceScaleId: "idx",
     priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
-  chart.priceScale("idx").applyOptions({ visible: false, scaleMargins: { top: 0.08, bottom: 0.18 } });
+  chart.priceScale("idx").applyOptions({ visible: false,
+    scaleMargins: MSChart.PRICE_SCALE_MARGINS });
 
   const pattern = (config.qualification && config.qualification.pattern) || {};
   const pivot = pattern.id ? pattern.pivot : null;
@@ -1050,12 +1171,16 @@ async function initChart(config, context, mount = {}) {
      the bars that happen to be loaded. */
   const priceReference = MSChart.referenceModel(seriesReference || config.reference);
   const referenceLines = [];
-  if (priceReference.available) {
+  /* Drawn from the published reference, cleared and redrawn whenever the "52-week lines"
+     overlay changes. The levels themselves never change with the timeframe or the zoom. */
+  const applyReferenceLines = () => {
+    referenceLines.splice(0).forEach((line) => candles.removePriceLine(line));
+    if (!priceReference.available || !overlays.reference_52w) return;
     drawPriceLine(priceReference.high, { color: "#3a4756", lineWidth: 1, lineStyle: 3,
       axisLabelVisible: true, title: priceReference.highTitle }, referenceLines);
     drawPriceLine(priceReference.low, { color: "#3a4756", lineWidth: 1, lineStyle: 3,
       axisLabelVisible: true, title: priceReference.lowTitle }, referenceLines);
-  }
+  };
   const setFineprint = (id, text) => { const target = $(id); if (target) target.textContent = text || ""; };
   /* RS-line events: computed once, from the canonical daily history and the daily
      benchmark closes. A timeframe switch only changes which bar carries the marker. */
@@ -1067,7 +1192,6 @@ async function initChart(config, context, mount = {}) {
       + `${rsEventState.lookback}-session high.`
     : `RS-line events: none — ${rsEventState.note} (benchmark Nifty 500, hash ${rsEventState.input_hash}).`);
   let timeframe = storedTimeframe();
-  let indexVisible = false;
   let bars = [];
   let maStore = loadMaPeriods();
   let maPeriods = MSChart.maSelection(maStore, timeframe);
@@ -1096,11 +1220,14 @@ async function initChart(config, context, mount = {}) {
     bars = timeframe === "D" ? daily : timeframe === "W"
       ? (weekly.length ? weekly : MSChart.aggregate(daily, "W")) : MSChart.aggregate(daily, "M");
     candles.setData(bars.map(([time, open, high, low, close]) => ({ time, open, high, low, close })));
-    const volumes = MSChart.volumeSeries(bars, timeframe === "D" ? 50 : 10);
+    const volumes = MSChart.volumeSeries(bars, MSChart.VOLUME_PERIODS[timeframe]);
     volume.setData(volumes.map((entry) => ({ time: entry.time, value: entry.value,
       color: entry.up ? "rgba(77,163,255,.35)" : "rgba(255,95,162,.35)" })));
     volumeAverage.setData(volumes.filter((entry) => entry.average !== null)
       .map((entry) => ({ time: entry.time, value: entry.average })));
+    // The volume pane names the average it draws, in the units of the timeframe on screen.
+    const volumeLegend = $("chart-volume-legend");
+    if (volumeLegend) volumeLegend.textContent = MSChart.volumeLegend(timeframe);
     const closes = bars.map((bar) => bar[4]);
     // Display only: the reader's moving-average choice changes what is drawn and nothing
     // else — no score, gate or signal reads it (SPEC-AH §5).
@@ -1115,31 +1242,35 @@ async function initChart(config, context, mount = {}) {
     });
     const legend = $("chart-ma-legend");
     if (legend) legend.textContent = MSChart.maLegend(periods, timeframe);
-    const rs = MSChart.rsLine(bars, rsCloses);
+    // Every overlay below is a switch the reader owns (SPEC-AJ §1.1). An overlay that is
+    // off draws nothing; the underlying row, pattern and dates are untouched.
+    const rs = overlays.rs_line ? MSChart.rsLine(bars, rsCloses) : { points: [] };
     rsSeries.setData(rs.points.map((point) => ({ time: point.time, value: point.value })));
     const rating = (config.ratings_compact || {}).rs;
     // The events come from the daily history; only their placement follows the timeframe.
-    const eventMarkers = MSChart.eventMarkers(rsEventState, bars, timeframe);
-    const latest = rs.points.length && rating
+    const eventMarkers = overlays.rs_events ? MSChart.eventMarkers(rsEventState, bars, timeframe) : [];
+    const latest = overlays.rs_line && rs.points.length && rating
       ? [{ time: rs.points[rs.points.length - 1].time, position: "belowBar", color: "#2ee6a8",
           shape: "arrowUp", text: `RS ${rating}`, kind: "rs_latest" }]
       : [];
-    const legMarkers = Screener.legMarkers(config.reference_pattern ? [] : config.legs,
-      bars.map((bar) => bar[0])).map((marker) => ({ ...marker, kind: "leg" }));
+    const legMarkers = (overlays.legs
+      ? Screener.legMarkers(config.reference_pattern ? [] : config.legs, bars.map((bar) => bar[0]))
+      : []).map((marker) => ({ ...marker, kind: "leg" }));
     const markers = MSChart.sortedMarkers(legMarkers, eventMarkers, latest);
     MSChart.assertSortedMarkers(markers);
     candles.setMarkers(markers);
-    indexSeries.setData(indexVisible
+    indexSeries.setData(overlays.index
       ? bars.map((bar) => (indexCloses.has(String(bar[0]))
         ? { time: bar[0], value: indexCloses.get(String(bar[0])) } : null)).filter(Boolean)
       : []);
     priceLines.splice(0).forEach((line) => candles.removePriceLine(line));
-    drawPriceLine(pivot, { color: "#2ee6a8", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "pivot" });
-    if (pattern.id) drawPriceLine(pattern.extension_limit, { color: "#f5a623", lineWidth: 1, lineStyle: 2, title: "5% extension limit" });
-    if (pattern.id) drawPriceLine(pattern.stop, { color: "#ef5350", lineWidth: 1, lineStyle: 1, axisLabelVisible: true, title: "stop" });
+    if (overlays.pivot) drawPriceLine(pivot, { color: "#2ee6a8", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "pivot" });
+    if (pattern.id && overlays.extension) drawPriceLine(pattern.extension_limit, { color: "#f5a623", lineWidth: 1, lineStyle: 2, title: "5% extension limit" });
+    if (pattern.id && overlays.stop) drawPriceLine(pattern.stop, { color: "#ef5350", lineWidth: 1, lineStyle: 1, axisLabelVisible: true, title: "stop" });
     const reference = config.reference_pattern?.pivot ?? (!pattern.id ? config.geometry_pivot : null);
-    if (Number.isFinite(reference)) drawPriceLine(reference, { color: "#f5a623", lineWidth: 1, lineStyle: 2,
+    if (Number.isFinite(reference) && overlays.geometry_pivot) drawPriceLine(reference, { color: "#f5a623", lineWidth: 1, lineStyle: 2,
       title: config.reference_pattern ? "power play · flag forming" : "geometry pivot" });
+    applyReferenceLines();
     const loaded = MSChart.loadedRange(bars);
     setFineprint("chart-reference", [
       priceReference.available
@@ -1150,17 +1281,35 @@ async function initChart(config, context, mount = {}) {
         : null,
       MSChart.partialLastNote(daily, timeframe, config.as_of || priceReference.asOf),
       timeframe === "W" && weeklyFallback ? weeklyFallback : null,
+      hiddenOverlayNote(),
     ].filter(Boolean).join(" · "));
     setFineprint("panel-reference-window", priceReference.available
       ? `${priceReference.window || "window unknown"} · ${priceReference.status}`
       : "no dated 52-week window in this snapshot");
-    chart.timeScale().fitContent();
+    applyWindow();
     positionBand();
     renderDrawings();
   }
 
+  /* The window preset is a preference, not a per-symbol state: it is applied after every
+     render, so a timeframe switch and the next stock both open on the same window. A
+     preset longer than the loaded history falls back to the whole history. */
+  function applyWindow() {
+    const range = MSChart.windowRange(view.window, timeframe, bars.length);
+    if (!range) { chart.timeScale().fitContent(); return; }
+    chart.timeScale().setVisibleLogicalRange(range);
+  }
+
+  /* The chart says which overlays are switched off, so a missing pivot line is never
+     read as "this build has no pivot". */
+  function hiddenOverlayNote() {
+    const off = MSChart.OVERLAYS.filter((entry) => !overlays[entry.id]).map((entry) => entry.label);
+    return off.length ? `overlays off: ${off.join(", ")}` : null;
+  }
+
   const positionBand = () => {
     if (!band) return;
+    if (!overlays.risk_band) { band.hidden = true; return; }
     if (!Number.isFinite(pivot) || !Number.isFinite(pattern.buy_zone_high) || pattern.buy_zone_high <= pivot) { band.hidden = true; return; }
     const upper = candles.priceToCoordinate(pattern.buy_zone_high);
     const lower = candles.priceToCoordinate(pivot);
@@ -1187,6 +1336,29 @@ async function initChart(config, context, mount = {}) {
     return node;
   }
 
+  /* The published base as a shaded band (SPEC-AJ §1.1): from ``base_start_date`` to the
+     last bar on screen, between ``base_low`` and ``base_high``. The boundaries come from
+     the scan; nothing here re-derives a base from the bars that happen to be loaded. */
+  function renderBaseBand(width, height) {
+    if (!overlays.base_band) return false;
+    const model = MSChart.baseBandModel(config.base_band, bars);
+    if (!model) return false;
+    const left = adapter.timeToCoordinate(model.start);
+    const right = adapter.timeToCoordinate(model.end);
+    const top = adapter.priceToCoordinate(model.high);
+    const bottom = adapter.priceToCoordinate(model.low);
+    if (![left, right, top, bottom].every((value) => Number.isFinite(value))) return false;
+    const rect = svg("rect", { x: Math.min(left, right), y: Math.min(top, bottom),
+      width: Math.max(1, Math.abs(right - left)), height: Math.max(1, Math.abs(bottom - top)),
+      fill: "rgba(77,163,255,.10)", stroke: "#4da3ff", "stroke-width": 1,
+      "stroke-dasharray": "4 3", "data-overlay": "base_band" });
+    const label = svg("title", {});
+    label.textContent = model.title;
+    rect.appendChild(label);
+    overlay.appendChild(rect);
+    return true;
+  }
+
   function renderDrawings() {
     if (!overlay) return;
     overlay.innerHTML = "";
@@ -1195,6 +1367,12 @@ async function initChart(config, context, mount = {}) {
     overlay.setAttribute("viewBox", `0 0 ${width} ${height}`);
     overlay.setAttribute("width", width);
     overlay.setAttribute("height", height);
+    // Drawn first, so the reader's own drawings stay on top of it.
+    const drawnBand = renderBaseBand(width, height);
+    // What the overlay actually drew this pass, for the page's own consistency checks.
+    overlay.dataset.overlays = MSChart.OVERLAYS
+      .filter((entry) => (entry.id === "base_band" ? drawnBand : overlays[entry.id]))
+      .map((entry) => entry.id).join(",");
     for (const drawing of drawings.concat(pending ? [pending] : [])) {
       // Dated points are binned onto the bars actually on screen (SPEC-AH §4), so a
       // drawing made on the daily chart still lands on the right weekly candle.
@@ -1340,12 +1518,58 @@ async function initChart(config, context, mount = {}) {
       other.setAttribute("aria-pressed", String(other.dataset.timeframe === timeframe)));
     maPeriods = MSChart.maSelection(maStore, timeframe);
     renderMaControls();
+    // The window is a preference, not a per-symbol or per-timeframe state: it is
+    // re-applied inside render() after every switch (SPEC-AJ §1.2).
     render();
   }));
-  $("toggle-index")?.addEventListener("click", () => {
-    indexVisible = !indexVisible;
-    $("toggle-index").setAttribute("aria-pressed", String(indexVisible));
-    render();
+  /* One checkbox per overlay, filled from the shared vocabulary so the toolbar and the
+     module can never disagree about which overlays exist. */
+  function renderOverlayControls() {
+    const tools = $("overlay-tools");
+    if (!tools) return;
+    tools.innerHTML = '<span class="ma-label">Overlays</span>' + MSChart.OVERLAYS
+      .map((entry) => `<label class="ma-toggle" title="${esc(entry.label)} (display only)">`
+        + `<input type="checkbox" data-overlay="${esc(entry.id)}"`
+        + `${overlays[entry.id] ? " checked" : ""}> ${esc(entry.label)}</label>`).join("");
+    document.querySelectorAll("#overlay-tools [data-overlay]").forEach((input) =>
+      input.addEventListener("change", () => {
+        overlays = MSChart.overlayStore(overlays, input.dataset.overlay, input.checked);
+        saveOverlays(overlays);
+        render();
+      }));
+  }
+
+  /* 6M · 1Y · 2Y · All, from the same module vocabulary. */
+  function renderWindowControls() {
+    const host = $("window-presets");
+    if (!host) return;
+    host.innerHTML = '<span class="ma-label">Window</span>' + MSChart.WINDOW_PRESETS
+      .map((preset) => `<button type="button" data-window="${esc(preset.id)}" `
+        + `aria-pressed="${preset.id === view.window}">${esc(preset.label)}</button>`).join("");
+    document.querySelectorAll("#window-presets [data-window]").forEach((button) =>
+      button.addEventListener("click", () => {
+        view = MSChart.viewStore(view, { window: button.dataset.window });
+        saveChartView(view);
+        document.querySelectorAll("#window-presets [data-window]").forEach((other) =>
+          other.setAttribute("aria-pressed", String(other.dataset.window === view.window)));
+        applyWindow();
+      }));
+  }
+
+  function renderScaleControl() {
+    const button = $("toggle-scale");
+    if (!button) return;
+    button.textContent = view.scale === "linear" ? "Linear" : "Log";
+    button.setAttribute("aria-pressed", String(view.scale === "log"));
+  }
+
+  $("toggle-scale")?.addEventListener("click", () => {
+    view = MSChart.viewStore(view, { scale: view.scale === "log" ? "linear" : "log" });
+    saveChartView(view);
+    renderScaleControl();
+    chart.priceScale("right").applyOptions({ mode: scaleMode() });
+    positionBand();
+    renderDrawings();
   });
   document.querySelectorAll("[data-expand]").forEach((button) => button.addEventListener("click", () => {
     button.previousElementSibling?.classList.add("expanded");
@@ -1392,6 +1616,9 @@ async function initChart(config, context, mount = {}) {
   document.querySelectorAll("[data-timeframe]").forEach((other) =>
     other.setAttribute("aria-pressed", String(other.dataset.timeframe === timeframe)));
   renderMaControls();
+  renderOverlayControls();
+  renderWindowControls();
+  renderScaleControl();
   render();
   requestAnimationFrame(() => requestAnimationFrame(() => { positionBand(); renderDrawings(); }));
 }
@@ -1509,6 +1736,7 @@ async function initTechnical() {
   initStockActions({ ...stock, symbol });
   const context = await loadListContext(symbol);
   renderListNav(context);
+  renderListPanel(context);
   const move = bindListNavigation(context);
   setPanel(panelOpen());
   $("toggle-panel")?.addEventListener("click", () =>
@@ -1522,6 +1750,8 @@ async function initTechnical() {
     indexPath: config.indexPath || "/data/index/NIFTY50.json",
     rsIndexPath: config.rsIndexPath || "/data/index/NIFTY500.json",
     qualification, legs: base.legs || [], geometry_pivot: base.pivot_hint ?? null,
+    base_band: { start_date: base.base_start_date ?? null, low: base.base_low ?? null,
+      high: base.base_high ?? null },
     reference_pattern: !pattern.id && power.flag === true
       ? { id: "power_play", pivot: power.pivot ?? null } : null,
     ratings_compact: ratings, tick_size: stock.tick_size ?? null,
@@ -1863,12 +2093,14 @@ function initStockActions(payload) {
   $("action-favorite")?.addEventListener("click", () => {
     MyLists.toggle(lists(), "favorites", { symbol });
     persistLists(); refresh();
+    renderListPanel();
     announce(MyLists.has(lists(), "favorites", symbol) ? `${symbol} added to Favorite Stocks` : `${symbol} removed from Favorite Stocks`);
   });
   for (const [id, verdict] of [["action-like", "liked"], ["action-dislike", "disliked"]]) {
     $(id)?.addEventListener("click", () => {
       MyLists.opinion(lists(), symbol, verdict);
       persistLists(); refresh();
+      renderListPanel();
       announce(MyLists.has(lists(), verdict, symbol) ? `${symbol} marked ${verdict}` : `${symbol} cleared`);
     });
   }
@@ -1881,6 +2113,43 @@ function initStockActions(payload) {
     MyLists.add(lists(), id, { symbol }, { title: answer, kind: "custom" });
     persistLists();
     announce(`${symbol} added to ${answer}`);
+  });
+  /* SPEC-AJ §1.5: a saved review decision. It is a note to yourself — stored in this
+     browser under My Lists → Reviewed, carried by the local app's /api/lists sync, and
+     nothing else. No AI verdict, no order, nothing leaves the page. */
+  const reviewContext = () => {
+    let stored = null;
+    try { stored = JSON.parse(sessionStorage.getItem(LIST_CONTEXT_KEY) || "null"); }
+    catch { stored = null; }
+    const requested = new URLSearchParams(window.location.search).get("list");
+    return { list: requested || (stored || {}).id || null, build_id: pageBuildId() || null };
+  };
+  const showReview = () => {
+    const saved = MyLists.reviewOf(lists(), symbol);
+    const node = $("review-state");
+    if (node) {
+      node.textContent = saved
+        ? `${MyLists.reviewLabel(saved)}${saved.note ? ` · ${saved.note}` : ""}`
+        : "Not reviewed in this browser.";
+    }
+    const select = $("review-decision");
+    if (select && saved && saved.decision) select.value = saved.decision;
+  };
+  $("action-review")?.addEventListener("click", () => {
+    const decision = $("review-decision")?.value;
+    if (!MyLists.DECISIONS.includes(decision)) {
+      announce("Choose buy-plan, watch or pass before saving a decision.");
+      return;
+    }
+    const existing = MyLists.reviewOf(lists(), symbol);
+    const note = window.prompt(`Note for ${symbol} (optional)`, (existing || {}).note || "");
+    // Cancelled: the decision already saved for this symbol stands, unchanged.
+    if (note === null) return;
+    MyLists.review(lists(), symbol, { decision, note, context: reviewContext() });
+    persistLists();
+    showReview();
+    renderListPanel();
+    announce(`${symbol} reviewed · ${decision} (stored in this browser)`);
   });
   $("action-position")?.addEventListener("click", () => {
     const quantity = window.prompt(`Quantity of ${symbol}`, "");
@@ -1898,6 +2167,7 @@ function initStockActions(payload) {
     announce(`${symbol} recorded in My Portfolio (${quantity} @ ${price})`);
   });
   refresh();
+  showReview();
 }
 
 /* ── §3 / §4 the browser-local pages ─────────────────────────────────────── */

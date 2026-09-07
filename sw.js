@@ -5,9 +5,9 @@ const SCOPE = new URL(self.registration.scope);
 const CACHE_PREFIX = `sepa-terminal:${encodeURIComponent(SCOPE.pathname)}:`;
 // One cache per build id: a snapshot cached by an earlier build can never be served
 // beside this build's pages, whatever the app-shell digest says.
-const BUILD_ID = "af7b2d064958";
+const BUILD_ID = "06901d984504";
 const BUILD_PREFIX = `${CACHE_PREFIX}${BUILD_ID}:`;
-const CACHE_NAME = BUILD_PREFIX + "ee116e9ad52b-8f8be850c94b";
+const CACHE_NAME = BUILD_PREFIX + "ee116e9ad52b-7f83c32f2b89";
 const APP_SHELL = ["./", "index.html", "site.css", "site.js", "screener.js", "mschart.js", "lists.js", "mylists.js", "portfolio.js", "screenfilters.js", "resources.js", "manifest.webmanifest", "s/index.html", "vendor/lightweight-charts.standalone.production.js", "privacy.html", "offline.html", "404.html", "icons/icon-192.png", "icons/icon-512.png", "icons/maskable-192.png", "icons/maskable-512.png", "icons/apple-touch-icon.png", "icons/feature-graphic.png"];
 const SHELL_URLS = new Set(APP_SHELL.map(path => new URL(path, SCOPE).href));
 const OFFLINE_URL = new URL("offline.html", SCOPE).href;
