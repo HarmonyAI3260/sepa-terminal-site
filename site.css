@@ -365,6 +365,10 @@ footer { padding: var(--s5) 0 0; color: var(--faint); font: .68rem var(--mono); 
 
 @media (max-width: 820px) {
   .shell { padding-inline: var(--s3); }
+  /* One column: the chart takes the full width and the data panel follows it. At 375 px
+     the two-column grid left the chart 49 px wide (fifth audit, mobile pass). */
+  .chart-layout { grid-template-columns: minmax(0, 1fr); }
+  .chart-layout .data-panel { order: 2; max-height: 420px; }
   .overview, .market-grid, .stock-grid, .brief-columns, .power-play-block { grid-template-columns: 1fr; }
   .market-grid .wide { grid-column: auto; }
   .stock-metrics { grid-template-columns: repeat(2, 1fr); }
