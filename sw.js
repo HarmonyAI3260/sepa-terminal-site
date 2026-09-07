@@ -7,8 +7,8 @@ const CACHE_PREFIX = `sepa-terminal:${encodeURIComponent(SCOPE.pathname)}:`;
 // beside this build's pages, whatever the app-shell digest says.
 const BUILD_ID = "06901d984504";
 const BUILD_PREFIX = `${CACHE_PREFIX}${BUILD_ID}:`;
-const CACHE_NAME = BUILD_PREFIX + "ee116e9ad52b-7f83c32f2b89";
-const APP_SHELL = ["./", "index.html", "site.css", "site.js", "screener.js", "mschart.js", "lists.js", "mylists.js", "portfolio.js", "screenfilters.js", "resources.js", "manifest.webmanifest", "s/index.html", "vendor/lightweight-charts.standalone.production.js", "privacy.html", "offline.html", "404.html", "icons/icon-192.png", "icons/icon-512.png", "icons/maskable-192.png", "icons/maskable-512.png", "icons/apple-touch-icon.png", "icons/feature-graphic.png"];
+const CACHE_NAME = BUILD_PREFIX + "ee116e9ad52b-55988ef4c7bc";
+const APP_SHELL = ["./", "index.html", "site.css", "site.js", "screener.js", "mschart.js", "lists.js", "mylists.js", "portfolio.js", "screenfilters.js", "resources.js", "manifest.webmanifest", "s/index.html", "chart/index.html", "vendor/lightweight-charts.standalone.production.js", "privacy.html", "offline.html", "404.html", "icons/icon-192.png", "icons/icon-512.png", "icons/maskable-192.png", "icons/maskable-512.png", "icons/apple-touch-icon.png", "icons/feature-graphic.png"];
 const SHELL_URLS = new Set(APP_SHELL.map(path => new URL(path, SCOPE).href));
 const OFFLINE_URL = new URL("offline.html", SCOPE).href;
 
@@ -42,6 +42,11 @@ function cacheKey(url) {
   // served by the one precached page.
   if (path === "s" || path === "s/" || path === "s/index.html") {
     return new URL("s/index.html", SCOPE).href;
+  }
+  // The full-screen chart workspace: "chart", "chart/", "chart/index.html" and any
+  // ?symbol= query are all served by the one precached page (SPEC-AK §1.5).
+  if (path === "chart" || path === "chart/" || path === "chart/index.html") {
+    return new URL("chart/index.html", SCOPE).href;
   }
   const stock = path.match(/^s\/([A-Z0-9][A-Z0-9&._-]*?)(?:\.html|\/(?:index\.html)?)?$/);
   if (stock) return new URL(`s/${stock[1]}.html`, SCOPE).href;

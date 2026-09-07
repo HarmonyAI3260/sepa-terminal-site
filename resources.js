@@ -15,8 +15,8 @@
 "use strict";
 const Resources = (() => {
   const SCHEMA_VERSION = "resource-1.0";
-  const KINDS = ["series", "weekly", "index", "stock", "routes", "list", "chart_model",
-    "screener"];
+  const KINDS = ["series", "weekly", "index", "stock", "stock_detail", "routes", "list",
+    "chart_model", "screener"];
   // ok  : the payload may render (status says how it must be labelled)
   // !ok : the dependent view must be blocked or replaced by a stated fallback
   const STATUSES = {

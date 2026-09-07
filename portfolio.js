@@ -742,6 +742,13 @@ const Portfolio = (() => {
     const contextLink = (listId, symbol, index) => (helpers.contextUrl
       ? `<a class="list-symbol" href="${esc(helpers.contextUrl(listId, symbol, index))}">${esc(symbol)}</a>`
       : link(symbol));
+    /* The same row in the full-screen chart workspace (SPEC-AK §1.4). A client that does
+       not publish that page passes no ``chartUrl`` and the mark is simply not rendered. */
+    const chartLink = (listId, symbol, index) => (helpers.chartUrl
+      ? `<a class="chart-view-link" href="${esc(helpers.chartUrl(listId, symbol, index))}"`
+        + ` title="Open ${esc(symbol)} in the full-screen chart"`
+        + ` aria-label="Open ${esc(symbol)} in the full-screen chart">⛶</a>`
+      : "");
 
     /* A rule this snapshot cannot answer reads "unknown". A set of unknown rules is
        never summarised as "clear" — that was the fifth audit's A4 in miniature. */
@@ -959,14 +966,14 @@ const Portfolio = (() => {
         // (SPEC-AJ §1.5), instead of quantity and average price.
         const review = list.kind === "review";
         const rows = (list.items || []).map((item, index) => (review
-          ? `<tr><td>${contextLink(list.id, item.symbol, index)}</td>
+          ? `<tr><td>${contextLink(list.id, item.symbol, index)}${chartLink(list.id, item.symbol, index)}</td>
           <td><b class="review-decision review-${esc(item.decision || "none")}">${esc(item.decision || "–")}</b></td>
           <td>${esc(String(item.reviewed_at || item.added_at || "").slice(0, 10) || "–")}</td>
           <td>${esc((item.context || {}).list || "–")}</td>
           <td>${esc(item.note || "")}</td>
           <td><button type="button" data-remove-list="${esc(list.id)}" data-remove-symbol="${esc(item.symbol)}">remove</button></td>
           </tr>`
-          : `<tr><td>${contextLink(list.id, item.symbol, index)}</td>
+          : `<tr><td>${contextLink(list.id, item.symbol, index)}${chartLink(list.id, item.symbol, index)}</td>
           <td>${item.qty === undefined ? "–" : fmt(item.qty, 0)}</td>
           <td>${item.avg_price === undefined ? "–" : money(item.avg_price)}</td>
           <td>${esc(item.entry_date || String(item.added_at || "").slice(0, 10) || "–")}</td>

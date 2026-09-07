@@ -808,6 +808,20 @@ function reviewMarkHtml(symbol) {
   return marks.join("");
 }
 
+/* Where a list row points. On the stock routes it is the stock page; inside the
+   full-screen workspace every row stays in the workspace, so Space and a click do the
+   same thing (SPEC-AK §1.3). One context object produces both. */
+function inChartView() {
+  return (document.body?.dataset || {}).page === "chartview";
+}
+
+function contextLink(context, symbol) {
+  const state = context || {};
+  const link = inChartView() ? Lists.chartLink : Lists.listLink;
+  return link(state.id, state.symbols, symbol, basePath(),
+    { sort: state.sort, pages: state.pages });
+}
+
 function renderListPanel(context) {
   if (context !== undefined) activeListContext = context;
   const panel = $("list-panel");
@@ -822,10 +836,10 @@ function renderListPanel(context) {
   const position = `${state.position || `not in ${state.title || state.id}`}${sorted}`;
   const rows = state.symbols.map((symbol, index) => {
     const reason = (state.reasons || {})[symbol];
-    const href = Lists.listLink(state.id, state.symbols, symbol, basePath(),
-      { sort: state.sort, pages: state.pages });
+    const href = contextLink(state, symbol);
     return `<li class="${index === state.index ? "current" : ""}" data-symbol="${esc(symbol)}">`
-      + `<a href="${esc(href)}"><b>${esc(symbol)}</b>`
+      + `<a href="${esc(href)}" data-chart-symbol="${esc(symbol)}" data-chart-index="${index}">`
+      + `<b>${esc(symbol)}</b>`
       + `<span class="panel-marks">${reviewMarkHtml(symbol)}</span></a>`
       + (reason ? `<em class="panel-reason">${esc(reason)}</em>` : "")
       + "</li>";
@@ -887,16 +901,24 @@ function bindListNavigation(context) {
 
 function toggleListDrawer(context) {
   let drawer = $("list-drawer");
-  if (drawer) { drawer.hidden = !drawer.hidden; return; }
-  drawer = document.createElement("aside");
-  drawer.id = "list-drawer";
-  drawer.className = "list-drawer";
+  if (drawer) {
+    drawer.hidden = !drawer.hidden;
+    // Re-drawn on the way in, so a drawer opened on an earlier stock still highlights
+    // the row the reader is on (SPEC-AK §1.3).
+    if (drawer.hidden) return;
+  }
+  const existing = Boolean(drawer);
+  if (!existing) {
+    drawer = document.createElement("aside");
+    drawer.id = "list-drawer";
+    drawer.className = "list-drawer";
+  }
   const items = context.symbols.map((symbol, index) =>
-    `<li${index === context.index ? ' class="current"' : ""}><a href="${esc(Lists.listLink(
-      context.id, context.symbols, symbol, basePath(),
-      { sort: context.sort, pages: context.pages }))}">${esc(symbol)}</a></li>`).join("");
+    `<li${index === context.index ? ' class="current"' : ""}>`
+    + `<a href="${esc(contextLink(context, symbol))}" data-chart-symbol="${esc(symbol)}" `
+    + `data-chart-index="${index}">${esc(symbol)}</a></li>`).join("");
   drawer.innerHTML = `<h3>${esc(context.title || context.id || "List")}</h3><ol>${items}</ol>`;
-  document.body.appendChild(drawer);
+  if (!existing) document.body.appendChild(drawer);
   drawer.querySelector("li.current")?.scrollIntoView({ block: "center" });
 }
 
@@ -915,10 +937,38 @@ function panelOpen() {
   try { return localStorage.getItem(PANEL_KEY) !== "0"; } catch { return true; }
 }
 
+/* The element that owns the data-panel column: the stock pages' chart layout, or the
+   full-screen workspace's body (SPEC-AK §1.2). One preference, two hosts. */
+function panelHost() {
+  return document.querySelector(".chartview-body") || document.querySelector(".chart-layout");
+}
+
+function panelHidden() {
+  return Boolean(panelHost()?.classList.contains("panel-hidden"));
+}
+
 function setPanel(open) {
-  document.querySelector(".chart-layout")?.classList.toggle("panel-hidden", !open);
+  panelHost()?.classList.toggle("panel-hidden", !open);
   $("toggle-panel")?.setAttribute("aria-pressed", String(open));
   try { localStorage.setItem(PANEL_KEY, open ? "1" : "0"); } catch { /* private mode */ }
+}
+
+/* Where the ⛶ control and the F key go from this page: the full-screen workspace, with
+   the list context this page is walking. Set once the context is known (SPEC-AK §1.4). */
+let chartViewHref = "";
+
+function setChartViewLink(symbol, context) {
+  const state = context || {};
+  chartViewHref = (state.id && (state.symbols || []).includes(symbol))
+    ? Lists.chartLink(state.id, state.symbols, symbol, basePath(),
+      { sort: state.sort, pages: state.pages })
+    : `${basePath()}/chart/?symbol=${encodeURIComponent(String(symbol || ""))}`;
+  const link = $("chart-fullscreen");
+  if (link) {
+    link.href = chartViewHref;
+    link.setAttribute("href", chartViewHref);
+  }
+  return chartViewHref;
 }
 
 function storedTimeframe() {
@@ -944,7 +994,8 @@ async function initStock() {
   const move = bindListNavigation(context);
   const gotoTab = bindTabs();
   setPanel(panelOpen());
-  $("toggle-panel")?.addEventListener("click", () => setPanel(document.querySelector(".chart-layout")?.classList.contains("panel-hidden")));
+  $("toggle-panel")?.addEventListener("click", () => setPanel(panelHidden()));
+  setChartViewLink(symbol, context);
   await initChart(config, context, { container, move, gotoTab });
 }
 
@@ -1031,7 +1082,39 @@ async function initChart(config, context, mount = {}) {
   const move = typeof mount.move === "function" ? mount.move : () => {};
   const gotoTab = typeof mount.gotoTab === "function" ? mount.gotoTab : () => {};
   const symbol = String(config.symbol || "");
-  if (!container) return;
+  /* SPEC-AK §1.3: one mount, one handle. Every listener, observer, subscription and the
+     chart itself are registered here and released by ``dispose()``, so the workspace can
+     mount the next symbol into the same hosts without leaving a second chart, a second
+     click handler on the toolbar or a second keyboard listener behind. */
+  const releases = [];
+  const bind = (target, type, listener, options) => {
+    if (!target || typeof target.addEventListener !== "function") return;
+    target.addEventListener(type, listener, options);
+    releases.push(() => {
+      if (typeof target.removeEventListener === "function") {
+        target.removeEventListener(type, listener, options);
+      }
+    });
+  };
+  const bindAll = (selector, type, listener) =>
+    document.querySelectorAll(selector).forEach((node) => bind(node, type, listener));
+  const handle = {
+    symbol,
+    disposed: false,
+    // The last bar of the canonical daily history, for a header that wants the session's
+    // volume without loading the series a second time.
+    lastBar: null,
+    handleKey: () => false,
+    dispose() {
+      if (handle.disposed) return;
+      handle.disposed = true;
+      while (releases.length) {
+        const release = releases.pop();
+        try { release(); } catch { /* a torn-down node cannot block the next mount */ }
+      }
+    },
+  };
+  if (!container) return handle;
 
   let daily = [];
   let weekly = [];
@@ -1052,7 +1135,7 @@ async function initChart(config, context, mount = {}) {
       // with this build's pattern, stop and risk band.
       container.innerHTML = '<div class="chart-loading negative">The chart is blocked: '
         + `${esc(Resources.describe(check))}. Reload for matching versions.</div>`;
-      return;
+      return handle;
     }
     if (Resources.badge(check)) resourceNotes.push(`price history ${Resources.badge(check)}`);
     if (series.note) {
@@ -1062,7 +1145,7 @@ async function initChart(config, context, mount = {}) {
     }
   } catch (error) {
     container.innerHTML = `<div class="chart-loading muted">Price series missing from this snapshot: ${esc(error.message)}</div>`;
-    return;
+    return handle;
   }
   if (config.weeklyPath) {
     try {
@@ -1111,11 +1194,12 @@ async function initChart(config, context, mount = {}) {
 
   if (!daily.length) {
     container.innerHTML = '<div class="chart-loading muted">Price series missing from this snapshot.</div>';
-    return;
+    return handle;
   }
+  handle.lastBar = daily[daily.length - 1];
   if (typeof LightweightCharts === "undefined") {
     container.innerHTML = '<div class="chart-loading muted">Chart library unavailable. Technical tables and snapshot figures remain available.</div>';
-    return;
+    return handle;
   }
   container.innerHTML = '<div class="chart-host"></div><svg class="draw-overlay" id="draw-overlay"></svg>'
     + '<div class="buy-zone-band" aria-hidden="true"><span>Risk-approved entry band</span></div>';
@@ -1136,8 +1220,10 @@ async function initChart(config, context, mount = {}) {
     crosshair: { ...themedChartOptions().crosshair, mode: LightweightCharts.CrosshairMode.Normal },
     height: Math.max(460, container.clientHeight), autoSize: true,
   });
-  // Repaint the frame (not the candles) whenever the theme changes.
-  onThemeChange(() => chart.applyOptions(themedChartOptions()));
+  // Repaint the frame (not the candles) whenever the theme changes — for as long as
+  // this chart exists.
+  releases.push(onThemeChange(() => chart.applyOptions(themedChartOptions())));
+  releases.push(() => chart.remove());
   const candles = chart.addCandlestickSeries({
     upColor: "#4da3ff", downColor: "#ff5fa2", wickUpColor: "#4da3ff", wickDownColor: "#ff5fa2",
     borderVisible: false,
@@ -1205,15 +1291,14 @@ async function initChart(config, context, mount = {}) {
     host.innerHTML = '<span class="ma-label">MAs</span>' + (MSChart.MA_PERIODS[timeframe] || [])
       .map((period) => `<label class="ma-toggle"><input type="checkbox" data-ma="${period}"`
         + `${maPeriods.includes(period) ? " checked" : ""}> ${period}${unit}</label>`).join("");
-    document.querySelectorAll("#ma-tools [data-ma]").forEach((input) =>
-      input.addEventListener("change", () => {
+    bindAll("#ma-tools [data-ma]", "change", () => {
         const chosen = [...document.querySelectorAll("#ma-tools [data-ma]")]
           .filter((entry) => entry.checked).map((entry) => Number(entry.dataset.ma));
         maStore = MSChart.maStore(maStore, timeframe, chosen);
         maPeriods = MSChart.maSelection(maStore, timeframe);
         saveMaPeriods(maStore);
         render();
-      }));
+      });
   }
 
   function render() {
@@ -1427,7 +1512,7 @@ async function initChart(config, context, mount = {}) {
     renderDrawings();
   }
 
-  overlay?.addEventListener("mousedown", (event) => {
+  bind(overlay, "mousedown", (event) => {
     const point = pointFromEvent(event);
     if (tool === "select") {
       selected = MSChart.hitTest(drawings, point, adapter, { bars, timeframe });
@@ -1462,7 +1547,7 @@ async function initChart(config, context, mount = {}) {
     pending = MSChart.createDrawing(tool, [{ time: point.time, price: point.price },
       { time: point.time, price: point.price }]);
   });
-  overlay?.addEventListener("mousemove", (event) => {
+  bind(overlay, "mousemove", (event) => {
     if (drag) {
       const point = pointFromEvent(event);
       const stamps = bars.map((bar) => String(bar[0]));
@@ -1485,33 +1570,37 @@ async function initChart(config, context, mount = {}) {
     pending.points[1] = { time: MSChart.readTime(point.time) || point.time, price: point.price };
     renderDrawings();
   });
-  overlay?.addEventListener("mouseup", () => {
+  bind(overlay, "mouseup", () => {
     if (drag) { drag = null; overlay.classList.remove("dragging"); persist(); return; }
     if (!pending) return;
     drawings.push(pending);
     pending = null;
     persist();
   });
-  document.querySelectorAll("[data-draw]").forEach((button) => button.addEventListener("click", () => {
+  bindAll("[data-draw]", "click", (event) => {
+    const button = event?.currentTarget || event?.target;
+    if (!button) return;
     tool = button.dataset.draw;
     document.querySelectorAll("[data-draw]").forEach((other) =>
       other.setAttribute("aria-pressed", String(other === button)));
     overlay?.classList.toggle("drawing", tool !== "select");
-  }));
-  document.querySelector('[data-draw-action="clear"]')?.addEventListener("click", () => {
+  });
+  bindAll('[data-draw-action="clear"]', "click", () => {
     drawings = []; selected = null; persist();
   });
-  document.querySelector('[data-draw-action="export"]')?.addEventListener("click", () => {
+  bindAll('[data-draw-action="export"]', "click", () => {
     downloadText(`${symbol}-drawings.json`, MSChart.exportDrawings(symbol, drawings), "application/json");
   });
-  document.querySelector('[data-draw-action="import"]')?.addEventListener("click", () => {
+  bindAll('[data-draw-action="import"]', "click", () => {
     const text = window.prompt("Paste exported drawings JSON");
     if (!text) return;
     try { drawings = drawings.concat(MSChart.importDrawings(text)); persist(); }
     catch { window.alert("That is not a drawings export from this app."); }
   });
 
-  document.querySelectorAll("[data-timeframe]").forEach((button) => button.addEventListener("click", () => {
+  bindAll("[data-timeframe]", "click", (event) => {
+    const button = event?.currentTarget || event?.target;
+    if (!button) return;
     timeframe = button.dataset.timeframe;
     try { localStorage.setItem(TIMEFRAME_KEY, timeframe); } catch { /* private mode */ }
     document.querySelectorAll("[data-timeframe]").forEach((other) =>
@@ -1521,7 +1610,7 @@ async function initChart(config, context, mount = {}) {
     // The window is a preference, not a per-symbol or per-timeframe state: it is
     // re-applied inside render() after every switch (SPEC-AJ §1.2).
     render();
-  }));
+  });
   /* One checkbox per overlay, filled from the shared vocabulary so the toolbar and the
      module can never disagree about which overlays exist. */
   function renderOverlayControls() {
@@ -1531,12 +1620,13 @@ async function initChart(config, context, mount = {}) {
       .map((entry) => `<label class="ma-toggle" title="${esc(entry.label)} (display only)">`
         + `<input type="checkbox" data-overlay="${esc(entry.id)}"`
         + `${overlays[entry.id] ? " checked" : ""}> ${esc(entry.label)}</label>`).join("");
-    document.querySelectorAll("#overlay-tools [data-overlay]").forEach((input) =>
-      input.addEventListener("change", () => {
-        overlays = MSChart.overlayStore(overlays, input.dataset.overlay, input.checked);
-        saveOverlays(overlays);
-        render();
-      }));
+    bindAll("#overlay-tools [data-overlay]", "change", (event) => {
+      const input = event?.currentTarget || event?.target;
+      if (!input) return;
+      overlays = MSChart.overlayStore(overlays, input.dataset.overlay, input.checked);
+      saveOverlays(overlays);
+      render();
+    });
   }
 
   /* 6M · 1Y · 2Y · All, from the same module vocabulary. */
@@ -1546,14 +1636,15 @@ async function initChart(config, context, mount = {}) {
     host.innerHTML = '<span class="ma-label">Window</span>' + MSChart.WINDOW_PRESETS
       .map((preset) => `<button type="button" data-window="${esc(preset.id)}" `
         + `aria-pressed="${preset.id === view.window}">${esc(preset.label)}</button>`).join("");
-    document.querySelectorAll("#window-presets [data-window]").forEach((button) =>
-      button.addEventListener("click", () => {
+    bindAll("#window-presets [data-window]", "click", (event) => {
+        const button = event?.currentTarget || event?.target;
+        if (!button) return;
         view = MSChart.viewStore(view, { window: button.dataset.window });
         saveChartView(view);
         document.querySelectorAll("#window-presets [data-window]").forEach((other) =>
           other.setAttribute("aria-pressed", String(other.dataset.window === view.window)));
         applyWindow();
-      }));
+      });
   }
 
   function renderScaleControl() {
@@ -1563,7 +1654,7 @@ async function initChart(config, context, mount = {}) {
     button.setAttribute("aria-pressed", String(view.scale === "log"));
   }
 
-  $("toggle-scale")?.addEventListener("click", () => {
+  bind($("toggle-scale"), "click", () => {
     view = MSChart.viewStore(view, { scale: view.scale === "log" ? "linear" : "log" });
     saveChartView(view);
     renderScaleControl();
@@ -1571,27 +1662,41 @@ async function initChart(config, context, mount = {}) {
     positionBand();
     renderDrawings();
   });
-  document.querySelectorAll("[data-expand]").forEach((button) => button.addEventListener("click", () => {
+  bindAll("[data-expand]", "click", (event) => {
+    const button = event?.currentTarget || event?.target;
+    if (!button) return;
     button.previousElementSibling?.classList.add("expanded");
     button.remove();
-  }));
+  });
 
-  window.addEventListener("keydown", (event) => {
+  /* Every key this chart owns. The page decides who listens: a stock route lets the
+     chart register the listener itself (and ``dispose`` removes it); the full-screen
+     workspace passes ``keyboard: false`` and forwards the events from its own single
+     listener, so mounting the next symbol never adds a second one (SPEC-AK §1.3).
+     Returns true when the chart consumed the event. */
+  const onKeyDown = (event) => {
     const action = MSChart.keyAction(event);
-    if (!action) return;
-    if (action === "next" || action === "prev") { event.preventDefault(); move(action === "next" ? 1 : -1); return; }
+    if (!action) return false;
+    if (action === "next" || action === "prev") { event.preventDefault(); move(action === "next" ? 1 : -1); return true; }
     if (action === "first" || action === "last") {
       const target = action === "first" ? 0 : context.symbols.length - 1;
       if (context.symbols.length) gotoListEntry(context, { ok: true, index: target, symbol: context.symbols[target] });
-      return;
+      return true;
+    }
+    if (action === "fullscreen") {
+      // SPEC-AK §1.4: F opens this symbol in the full-screen workspace, with the list
+      // context the page is already carrying.
+      if (chartViewHref) window.location.href = chartViewHref;
+      return true;
     }
     if (action.startsWith("timeframe:")) {
       document.querySelector(`[data-timeframe="${action.slice(10)}"]`)?.click();
-      return;
+      return true;
     }
-    if (action === "panel") { setPanel(document.querySelector(".chart-layout")?.classList.contains("panel-hidden")); return; }
-    if (action === "list") { toggleListDrawer(context); return; }
+    if (action === "panel") { setPanel(panelHidden()); return true; }
+    if (action === "list") { toggleListDrawer(context); return true; }
     if (action === "cancel") {
+      const active = Boolean(drag || pending || selected || tool !== "select");
       // Escape during a drag restores the drawing exactly as it was before the move.
       if (drag) {
         const index = drawings.findIndex((entry) => entry.id === drag.id);
@@ -1599,20 +1704,32 @@ async function initChart(config, context, mount = {}) {
         drag = null;
         overlay?.classList.remove("dragging");
       }
-      pending = null; selected = null; tool = "select"; renderDrawings(); return;
+      pending = null; selected = null; tool = "select"; renderDrawings();
+      return active;
     }
     if (action === "delete" && selected) {
       drawings = drawings.filter((entry) => entry.id !== selected.id);
       selected = null;
       persist();
-      return;
+      return true;
     }
-    if (action.startsWith("tab:")) gotoTab(Number(action.slice(4)));
-  });
+    if (action.startsWith("tab:")) { gotoTab(Number(action.slice(4))); return true; }
+    return false;
+  };
+  handle.handleKey = onKeyDown;
+  if (mount.keyboard !== false) bind(window, "keydown", onKeyDown);
 
-  chart.timeScale().subscribeVisibleTimeRangeChange(() => { positionBand(); renderDrawings(); });
+  const onTimeRange = () => { positionBand(); renderDrawings(); };
+  chart.timeScale().subscribeVisibleTimeRangeChange(onTimeRange);
   chart.timeScale().subscribeVisibleLogicalRangeChange(positionBand);
-  new ResizeObserver(() => { positionBand(); renderDrawings(); }).observe(host);
+  releases.push(() => {
+    const scale = chart.timeScale();
+    scale.unsubscribeVisibleTimeRangeChange?.(onTimeRange);
+    scale.unsubscribeVisibleLogicalRangeChange?.(positionBand);
+  });
+  const resize = new ResizeObserver(() => { positionBand(); renderDrawings(); });
+  resize.observe(host);
+  releases.push(() => resize.disconnect());
   document.querySelectorAll("[data-timeframe]").forEach((other) =>
     other.setAttribute("aria-pressed", String(other.dataset.timeframe === timeframe)));
   renderMaControls();
@@ -1621,6 +1738,7 @@ async function initChart(config, context, mount = {}) {
   renderScaleControl();
   render();
   requestAnimationFrame(() => requestAnimationFrame(() => { positionBand(); renderDrawings(); }));
+  return handle;
 }
 
 /* ── the generic technical route (SPEC-AG §4.2) ───────────────────────────────
@@ -1739,8 +1857,8 @@ async function initTechnical() {
   renderListPanel(context);
   const move = bindListNavigation(context);
   setPanel(panelOpen());
-  $("toggle-panel")?.addEventListener("click", () =>
-    setPanel(document.querySelector(".chart-layout")?.classList.contains("panel-hidden")));
+  $("toggle-panel")?.addEventListener("click", () => setPanel(panelHidden()));
+  setChartViewLink(symbol, context);
 
   const pattern = qualification.pattern || {};
   const chartConfig = {
@@ -1827,6 +1945,405 @@ function renderTechnicalPanel(stock) {
     + "</div>";
 }
 
+/* ── the full-screen chart workspace (SPEC-AK) ────────────────────────────────
+   One published page, ``/chart/?symbol=…&list=…&sort=…&i=…``, renders any scanned symbol
+   in a viewport-filling workspace: the header strip, the ordered list the reader arrived
+   from, the data panel with the quarterly block, and the chart. Space moves to the next
+   symbol in that list WITHOUT a page load — the hosts are re-filled, the chart is
+   disposed and re-mounted, and ``history.pushState`` records the move — so the browser's
+   native full-screen state (and the reader's scroll, zoom and drawings tool) survive.
+
+   Nothing here re-implements a panel: a symbol with a full research page renders the
+   fragments that page published (``data/stock-detail/<SYM>.json``), and every other
+   symbol renders the technical panel from ``data/stock/<SYM>.json``. Every fetch goes
+   through ``loadResource``, so a foreign or missing file is reported, never drawn as
+   this build's. */
+
+const CHARTVIEW_EPS_DUE = "n/a (no results-calendar feed)";
+const CHARTVIEW_DETAIL_ONLY = "published with the full research payload; this symbol has "
+  + "a technical page in this snapshot";
+
+function chartViewFigure(key, label, value, note, extra) {
+  const missing = value === null || value === undefined || value === "";
+  const title = missing ? (note || "not available in this snapshot") : (note || "");
+  return `<div data-figure="${esc(key)}"${title ? ` title="${esc(title)}"` : ""}>`
+    + `<span>${esc(label)}</span>`
+    + `<b${missing ? ' class="na"' : ""}>${missing ? "n/a" : esc(value)}</b>`
+    + (extra ? `<em>${esc(extra)}</em>` : "") + "</div>";
+}
+
+/* The header strip's figures, from the compact row this build published for the symbol
+   plus (on a full page) its financial payload. A figure this snapshot does not carry
+   prints "n/a" with the reason it is missing as its title — never a blank. */
+function chartViewFigures(stock, detail) {
+  const facts = { ...((stock || {}).facts || {}), ...((detail || {}).facts || {}) };
+  const notes = { ...((stock || {}).facts_notes || {}), ...((detail || {}).facts_notes || {}) };
+  const reason = (key) => notes[key] || (detail ? "not available in this snapshot"
+    : CHARTVIEW_DETAIL_ONLY);
+  const number = (value, digits = 0) => (value === null || value === undefined
+    ? null : fmt(value, digits));
+  const reference = (detail || {}).reference || {};
+  const high = facts.hi_52w ?? reference.high;
+  const low = facts.lo_52w ?? reference.low;
+  const volume = facts.volume_last;
+  return [
+    chartViewFigure("market_cap", "Market cap", number(facts.market_cap_cr) && `₹${fmt(facts.market_cap_cr, 0)} Cr`,
+      reason("market_cap_cr"), facts.market_cap_source || ""),
+    chartViewFigure("float", "Shares float", number(facts.float_cr, 2) && `${fmt(facts.float_cr, 2)} Cr`,
+      reason("float_cr")),
+    chartViewFigure("shares_outstanding", "Shares out", number(facts.shares_outstanding_cr, 2)
+      && `${fmt(facts.shares_outstanding_cr, 2)} Cr`, reason("shares_outstanding_cr")),
+    chartViewFigure("sales_ttm", "Sales (TTM)", number(facts.sales_ttm_cr) && `₹${fmt(facts.sales_ttm_cr, 0)} Cr`,
+      reason("sales_ttm_cr")),
+    chartViewFigure("avg_volume_50d", "50-day avg vol", number(facts.avg_volume_50d), reason("avg_volume_50d")),
+    chartViewFigure("off_52w_high", "Off 52w high", number(facts.off_52w_high_pct, 1)
+      && `${signed(facts.off_52w_high_pct)}`, reason("off_52w_high_pct")),
+    chartViewFigure("reference_52w", "52-week hi–lo", high === null || high === undefined || low === null
+      || low === undefined ? null : `₹${fmt(low, 2)} – ₹${fmt(high, 2)}`,
+    "the dated 52-week window this build published with the series"),
+    chartViewFigure("eps_due", "EPS due", null, CHARTVIEW_EPS_DUE),
+    chartViewFigure("price", "Price", (stock || {}).close === null || (stock || {}).close === undefined
+      ? null : `₹${fmt(stock.close, 2)}`, "last published close",
+    (stock || {}).last_date || ""),
+    chartViewFigure("change", "Change", (stock || {}).chg_pct === null || (stock || {}).chg_pct === undefined
+      ? null : signed(stock.chg_pct), "change on the last published session"),
+    chartViewFigure("volume", "Volume", volume === null || volume === undefined ? null : fmt(volume, 0),
+      volume === null || volume === undefined ? reason("volume_last")
+        : "last published session"),
+    chartViewFigure("rs_tt_stage", "RS · TT · Stage", `${fmt((stock || {}).rs, 0)} · `
+      + `${fmt(((stock || {}).tt || {}).passed, 0)}/8 · ${(stock || {}).stage || "unknown"}`,
+    "relative strength, Trend Template and stage from this snapshot"),
+  ].join("");
+}
+
+async function initChartView() {
+  const configNode = $("chartview-config");
+  if (!configNode) return null;
+  let config = {};
+  try { config = JSON.parse(configNode.textContent); } catch { config = {}; }
+  const search = $("chartview-search");
+  const requested = String(new URLSearchParams(window.location.search).get("symbol") || "")
+    .trim().toUpperCase();
+  // The list the reader arrived from, read once. Walking it only changes the index, so
+  // the workspace never refetches a list payload to move one row.
+  let base = await loadListContext(requested);
+  let context = base;
+  let handle = null;
+  let disposals = 0;
+  let current = "";
+
+  const rebase = (symbol, index) => {
+    const at = Number.isInteger(index) ? index : (base.symbols || []).indexOf(symbol);
+    const next = MSChart.listContext({ id: base.id, title: base.title, build_id: base.build_id,
+      symbols: base.symbols, index: at, sort: base.sort, pages: base.pages,
+      unresolved: base.unresolved, fallback: base.fallback }, symbol);
+    next.reasons = base.reasons;
+    next.error = base.error;
+    return next;
+  };
+
+  const status = (text) => { const node = $("chartview-position"); if (node) node.textContent = text; };
+  const notes = (text) => { const node = $("chartview-notes"); if (node) node.textContent = text || ""; };
+
+  const move = (step) => {
+    const label = $("list-position");
+    const confirmWrap = label?.dataset.confirmWrap === "1";
+    const result = MSChart.advance(context, step, { confirmWrap });
+    if (label) delete label.dataset.confirmWrap;
+    if (!result.ok) {
+      if (label && result.needsConfirmation) {
+        label.textContent = `${result.reason} — press again to wrap`;
+        label.dataset.confirmWrap = "1";
+      }
+      return false;
+    }
+    showSymbol(result.symbol, { index: result.index });
+    return true;
+  };
+
+  const jump = (position) => {
+    if (!(context.symbols || []).length) return;
+    const index = Math.max(0, Math.min(context.symbols.length - 1, position));
+    showSymbol(context.symbols[index], { index });
+  };
+
+  async function mountChart(chartConfig) {
+    if (handle) { handle.dispose(); handle = null; disposals += 1; }
+    handle = await initChart(chartConfig, context,
+      { container: $("chart"), move, gotoTab: () => {}, keyboard: false });
+    return handle;
+  }
+
+  /* One symbol into the workspace. ``push`` records the move in the session history;
+     a popstate replay passes ``push: false`` so the back button does not re-push. */
+  async function showSymbol(symbol, options = {}) {
+    const wanted = String(symbol || "").trim().toUpperCase();
+    if (!wanted || !TECHNICAL_SYMBOL_RE.test(wanted)) return null;
+    current = wanted;
+    context = rebase(wanted, options.index);
+    activeListContext = context;
+    document.title = `${wanted} · chart — SEPA Terminal`;
+    const name = $("chartview-name");
+    if (name) name.textContent = wanted;
+    if (search) search.value = "";
+    renderListPanel(context);
+    renderListNav(context);
+    rememberListContext(context, { source: "url" });
+    status(`${context.position || `not in ${context.title || context.id || "any list"}`}`
+      + `${context.sort ? ` · sorted by ${context.sort.key} ${context.sort.direction}` : ""}`);
+    if (options.push !== false) {
+      const url = Lists.chartLink(context.id, context.symbols, wanted, basePath(),
+        { sort: context.sort, pages: context.pages });
+      try { window.history.pushState({ symbol: wanted, index: context.index }, "", url); }
+      catch { /* a browser that refuses the state change still shows the symbol */ }
+    }
+    const exit = $("chartview-exit");
+    if (exit) {
+      // The route manifest resolves the destination, so a symbol reached from the search
+      // box (and therefore not in the list) still opens its own page.
+      const href = Lists.listLink(context.id, context.symbols, wanted, basePath(),
+        { sort: context.sort, pages: routePages || context.pages });
+      exit.href = href;
+      exit.setAttribute("href", href);
+    }
+
+    let stock = null;
+    let check = null;
+    let resourceId = `stock/${wanted}`;
+    try {
+      const loaded = await loadResource(
+        `${config.stockPath || "/data/stock/"}${encodeURIComponent(wanted)}.json`,
+        { kind: "stock", instrument: wanted, asOf: config.as_of });
+      stock = loaded.payload;
+      check = loaded.check;
+      resourceId = loaded.id;
+    } catch {
+      renderMissing(wanted, `${wanted} is not in this snapshot (as of `
+        + `${config.as_of || "unknown"}). It may be outside the scanned universe or `
+        + "excluded by the universe ledger.");
+      return null;
+    }
+    checkBuildId(stock.build_id, stock.last_date || config.as_of, resourceId);
+    if (check && !check.ok) {
+      // The row this workspace renders is the resource: an incompatible one is reported
+      // with the symbol still in the header, never drawn as current.
+      renderMissing(wanted, `${Resources.describe(check)}. Reload for matching versions.`);
+      return null;
+    }
+    if (name) name.textContent = `${stock.name || wanted} · ${wanted}`;
+    const route = Lists.pageOf(wanted, routePages) || "technical";
+    let detail = null;
+    if (route === "full") {
+      try {
+        const loaded = await loadResource(
+          `${config.detailPath || "/data/stock-detail/"}${encodeURIComponent(wanted)}.json`,
+          { kind: "stock_detail", instrument: wanted, asOf: config.as_of });
+        detail = loaded.check.ok ? loaded.payload : null;
+        if (!loaded.check.ok) notes(Resources.describe(loaded.check));
+      } catch { detail = null; }
+    }
+    renderHeader(wanted, stock, detail, route);
+    renderPanels(wanted, stock, detail, route);
+    initStockActions({ ...stock, symbol: wanted });
+    const mounted = await mountChart(chartConfig(wanted, stock, detail));
+    // Only the daily history knows the last session's volume when the compact row does
+    // not carry it, so the figure is filled in once the chart has loaded that series.
+    if (mounted && mounted.lastBar && (stock.facts || {}).volume_last === undefined) {
+      const cell = document.querySelector('#chartview-figures [data-figure="volume"] b');
+      if (cell) { cell.textContent = fmt(mounted.lastBar[5], 0); cell.className = ""; }
+    }
+    return mounted;
+  }
+
+  function renderMissing(symbol, message) {
+    const name = $("chartview-name");
+    if (name) name.textContent = symbol;
+    const meta = $("chartview-meta");
+    if (meta) meta.textContent = "";
+    const figures = $("chartview-figures");
+    if (figures) figures.innerHTML = "";
+    const host = $("chartview-data");
+    if (host) {
+      host.innerHTML = '<div class="data-panel" id="data-panel">'
+        + `<p class="list-empty">${esc(message)}</p>`
+        + `<p class="fineprint"><a href="${esc(siteUrl(`/?q=${encodeURIComponent(symbol)}#screener`))}">`
+        + `Search the screener for ${esc(symbol)} →</a></p></div>`;
+    }
+    const chart = $("chart");
+    if (chart) chart.innerHTML = `<div class="chart-loading muted">${esc(message)}</div>`;
+    if (handle) { handle.dispose(); handle = null; disposals += 1; }
+    notes(message);
+  }
+
+  function renderHeader(symbol, stock, detail, route) {
+    const group = (stock || {}).group || {};
+    const links = (detail || {}).links || {};
+    const website = links.website || links.screener || null;
+    const meta = $("chartview-meta");
+    if (meta) {
+      meta.innerHTML = [
+        `<b>${esc(symbol)}</b>`,
+        esc(group.name || "unmapped industry group"),
+        group.rank ? `rank ${esc(group.rank)} of ${esc(group.of)}` : "no ranked group",
+        website ? `<a href="${esc(website)}" rel="noopener nofollow" target="_blank">website ↗</a>`
+          : "no website in this snapshot",
+        route === "full" ? "full research page" : "technical view (no financial deep dive)",
+      ].join(" · ");
+    }
+    const about = $("chartview-about");
+    if (about) {
+      about.textContent = (detail || {}).about
+        || `No description is cached for ${symbol} in this snapshot.`;
+      about.classList.remove("expanded");
+    }
+    const figures = $("chartview-figures");
+    if (figures) figures.innerHTML = chartViewFigures(stock, detail);
+  }
+
+  function renderPanels(symbol, stock, detail, route) {
+    const host = $("chartview-data");
+    if (!host) return;
+    if (detail && (detail.fragments || {}).data_panel) {
+      // The full page's own markup, published with it: the workspace shows the panel and
+      // the quarterly block byte for byte, it does not re-render them.
+      host.innerHTML = detail.fragments.data_panel + (detail.fragments.quarterly_block || "");
+      initQuarterlyBlock();
+      return;
+    }
+    const coverage = config.coverage || {};
+    host.innerHTML = '<div class="data-panel" id="data-panel"></div>'
+      + '<section class="card"><span class="eyebrow">FINANCIAL RECORD</span>'
+      + "<h2>Financial record</h2>"
+      + `<p>No financial deep dive for ${esc(symbol)} in this snapshot — full pages cover `
+      + `${fmt(coverage.full, 0)} of ${fmt(coverage.rows, 0)} symbols (Trend Template ≥ 6/8 `
+      + "and the turnover gate). Fundamentals: unknown, not failed.</p>"
+      + (route === "full"
+        ? '<p class="fineprint negative">This symbol has a full research page, but its '
+          + 'detail file could not be read in this snapshot.</p>' : "")
+      + `<p class="fineprint"><a href="${esc(siteUrl(`/?q=${encodeURIComponent(symbol)}#screener`))}">`
+      + "Open this row in the screener →</a></p></section>";
+    renderTechnicalPanel(stock);
+  }
+
+  /* The chart's configuration: the full page's own payload when there is one, otherwise
+     the same object the technical route assembles from the compact row. */
+  function chartConfig(symbol, stock, detail) {
+    if (detail) {
+      return { ...detail, symbol, as_of: detail.as_of || config.as_of };
+    }
+    const base_ = (stock || {}).base || {};
+    const power = (stock || {}).power_play || {};
+    const qualification = (stock || {}).qualification || {};
+    const pattern = qualification.pattern || {};
+    return {
+      symbol, name: (stock || {}).name || symbol, as_of: config.as_of,
+      seriesPath: `${config.seriesPath || "/data/series/"}${encodeURIComponent(symbol)}.json`,
+      weeklyPath: null,
+      indexPath: config.indexPath || "/data/index/NIFTY50.json",
+      rsIndexPath: config.rsIndexPath || "/data/index/NIFTY500.json",
+      qualification, legs: base_.legs || [], geometry_pivot: base_.pivot_hint ?? null,
+      base_band: { start_date: base_.base_start_date ?? null, low: base_.base_low ?? null,
+        high: base_.base_high ?? null },
+      reference_pattern: !pattern.id && power.flag === true
+        ? { id: "power_play", pivot: power.pivot ?? null } : null,
+      ratings_compact: (stock || {}).ratings || {}, tick_size: (stock || {}).tick_size ?? null,
+      close: (stock || {}).close, chg_pct: (stock || {}).chg_pct,
+    };
+  }
+
+  const toggleFullscreen = () => {
+    const button = $("chartview-fullscreen");
+    try {
+      if (document.fullscreenElement) {
+        document.exitFullscreen?.();
+        button?.setAttribute("aria-pressed", "false");
+      } else {
+        document.documentElement.requestFullscreen?.();
+        button?.setAttribute("aria-pressed", "true");
+      }
+    } catch { /* a browser that refuses full screen keeps the page's own full viewport */ }
+  };
+
+  const exitToPage = () => {
+    const href = $("chartview-exit")?.href;
+    if (href) window.location.href = href;
+  };
+
+  // ── the page's controls, bound once ──────────────────────────────────────
+  $("list-prev")?.addEventListener("click", () => move(-1));
+  $("list-next")?.addEventListener("click", () => move(1));
+  $("list-open")?.addEventListener("click", () => toggleListDrawer(context));
+  $("chartview-fullscreen")?.addEventListener("click", toggleFullscreen);
+  $("chartview-about")?.addEventListener("click", (event) =>
+    event.currentTarget?.classList?.toggle("expanded"));
+  $("toggle-panel")?.addEventListener("click", () => setPanel(panelHidden()));
+  search?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    const wanted = String(search.value || "").trim().toUpperCase();
+    if (wanted) showSymbol(wanted);
+  });
+  // A click on a list row stays in the workspace; a middle-click or a modified click is
+  // left to the browser, so "open in a new tab" still works.
+  document.addEventListener?.("click", (event) => {
+    const link = event.target?.closest?.("a[data-chart-symbol]");
+    if (!link || event.defaultPrevented) return;
+    if (event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    const index = Number.parseInt(link.dataset.chartIndex, 10);
+    showSymbol(link.dataset.chartSymbol, { index: Number.isInteger(index) ? index : undefined });
+  });
+  window.addEventListener("popstate", (event) => {
+    const state = (event && event.state) || {};
+    const symbol = state.symbol
+      || String(new URLSearchParams(window.location.search).get("symbol") || "");
+    if (symbol) showSymbol(symbol, { push: false, index: state.index });
+  });
+  /* One keyboard listener for the whole workspace, registered once — not per mount. The
+     chart is handed only the keys it owns (drawings), through the handle. It listens in
+     the capture phase so it sees the shortcut overlay still open on Escape: the bubbling
+     handler that closes that overlay must not also send the reader back to the page. */
+  window.addEventListener("keydown", (event) => {
+    const action = MSChart.keyAction(event);
+    if (!action) return;
+    if (action === "next" || action === "prev") { event.preventDefault(); move(action === "next" ? 1 : -1); return; }
+    if (action === "first") { jump(0); return; }
+    if (action === "last") { jump((context.symbols || []).length - 1); return; }
+    if (action === "fullscreen") { event.preventDefault(); toggleFullscreen(); return; }
+    if (action === "search") { event.preventDefault(); search?.focus?.(); return; }
+    if (action.startsWith("timeframe:")) {
+      document.querySelector(`[data-timeframe="${action.slice(10)}"]`)?.click();
+      return;
+    }
+    if (action === "panel") { setPanel(panelHidden()); return; }
+    if (action === "list") { toggleListDrawer(context); return; }
+    if (action === "cancel") {
+      // A pending drawing first, then the browser's own full-screen exit, and only then
+      // back to the page this symbol came from.
+      if (handle && handle.handleKey(event)) return;
+      if ($("key-help") && $("key-help").hidden === false) return;
+      if (document.fullscreenElement) return;
+      exitToPage();
+      return;
+    }
+    if (handle) handle.handleKey(event);
+  }, true);
+
+  setPanel(panelOpen());
+  renderListPanel(context);
+  renderListNav(context);
+  await loadRoutes(config.routesPath || "/data/routes.json");
+  if (!requested || !TECHNICAL_SYMBOL_RE.test(requested)) {
+    renderMissing(requested || "No symbol requested",
+      "Open a stock from a list, or use the screener to find one.");
+    status("no symbol requested");
+    return { showSymbol, disposals: () => disposals, context: () => context };
+  }
+  await showSymbol(requested, { push: false, index: base.index });
+  return { showSymbol, disposals: () => disposals, context: () => context,
+    handle: () => handle };
+}
+
 /* ── list pages ───────────────────────────────────────────────────────────── */
 function initSidebar() {
   const toggle = $("sidebar-toggle");
@@ -1897,6 +2414,15 @@ async function initList() {
   const linkFor = (rows, symbol) => Lists.listLink(payload.id, rows.map((row) => String(row.symbol)),
     String(symbol), document.documentElement.dataset.basePath || "",
     { sort: currentSort(), pages });
+  /* SPEC-AK §1.4: the same row, opened straight in the full-screen workspace with the
+     order the reader is looking at — so the ⛶ on a card and Space in the workspace walk
+     one list. */
+  const chartFor = (rows, symbol) => Lists.chartLink(payload.id, rows.map((row) => String(row.symbol)),
+    String(symbol), document.documentElement.dataset.basePath || "",
+    { sort: currentSort(), pages });
+  const chartMark = (rows, symbol) => `<a class="chart-view-link" href="${esc(chartFor(rows, symbol))}"`
+    + ` title="Open ${esc(symbol)} in the full-screen chart"`
+    + ` aria-label="Open ${esc(symbol)} in the full-screen chart">⛶</a>`;
 
   function ordered() {
     return Lists.sortRows(payload.rows, sortKey, Lists.defaultDirection(sortKey), extrasFor);
@@ -1906,7 +2432,8 @@ async function initList() {
     const head = payload.columns.map((key) => `<th>${esc((payload.column_labels || {})[key] || key)}</th>`).join("");
     const body = rows.map((row) => `<tr>${payload.columns.map((key) => {
       if (key === "symbol") {
-        return `<td><a class="list-symbol" href="${esc(linkFor(all, row.symbol))}">${esc(row.symbol)}</a></td>`;
+        return `<td><a class="list-symbol" href="${esc(linkFor(all, row.symbol))}">${esc(row.symbol)}</a>`
+          + `${chartMark(all, row.symbol)}</td>`;
       }
       return `<td>${esc(Lists.formatCell(row, key, extrasFor(row)))}</td>`;
     }).join("")}<td class="row-actions-cell">${listActionsHtml(row.symbol)}</td></tr>`).join("");
@@ -1921,7 +2448,7 @@ async function initList() {
       const spark = card.spark
         ? `<svg class="spark" viewBox="0 0 160 44" preserveAspectRatio="none"><polyline points="${esc(card.spark)}"/></svg>`
         : `<p class="spark-missing">no weekly series published for this symbol</p>`;
-      return `<article class="list-card"><a href="${esc(href)}"><header><b>${esc(card.symbol)}</b><small>${esc(card.name)}</small></header>
+      return `<article class="list-card">${chartMark(all, card.symbol)}<a href="${esc(href)}"><header><b>${esc(card.symbol)}</b><small>${esc(card.name)}</small></header>
         ${spark}
         <div class="list-card-price"><b>${esc(card.close)}</b><span class="${esc(card.changeClass)}">${esc(card.change)}</span></div>
         <dl>${card.ratings.map((entry) => `<div><dt>${esc(entry.label)}</dt><dd>${esc(entry.value)}</dd></div>`).join("")}</dl></a>${listActionsHtml(card.symbol)}</article>`;
@@ -2074,10 +2601,21 @@ function bindListActions(container, redraw) {
   });
 }
 
+/* The symbol the action bar is pointed at, and whether its controls are already bound.
+   The stock routes call ``initStockActions`` once; the full-screen workspace calls it
+   again for every symbol, and must not end up with one handler per stock (SPEC-AK §1.3):
+   the handlers read ``actionSymbol``/``actionPayload``, which the next call re-points. */
+let actionSymbol = "";
+let actionPayload = {};
+let actionsBound = false;
+
 function initStockActions(payload) {
   const host = $("stock-actions");
   if (!host) return;
   const symbol = String(payload.symbol || host.dataset.symbol || "");
+  actionSymbol = symbol;
+  actionPayload = payload || {};
+  host.dataset.symbol = symbol;
   const status = $("action-status");
   const store = lists();
   MyLists.touchRecent(store, symbol);
@@ -2086,34 +2624,11 @@ function initStockActions(payload) {
     for (const [id, list] of [["action-favorite", "favorites"], ["action-like", "liked"],
       ["action-dislike", "disliked"]]) {
       const button = $(id);
-      if (button) button.setAttribute("aria-pressed", String(MyLists.has(lists(), list, symbol)));
+      if (button) button.setAttribute("aria-pressed", String(MyLists.has(lists(), list, actionSymbol)));
     }
   };
-  const announce = (text) => { if (status) status.textContent = text; };
-  $("action-favorite")?.addEventListener("click", () => {
-    MyLists.toggle(lists(), "favorites", { symbol });
-    persistLists(); refresh();
-    renderListPanel();
-    announce(MyLists.has(lists(), "favorites", symbol) ? `${symbol} added to Favorite Stocks` : `${symbol} removed from Favorite Stocks`);
-  });
-  for (const [id, verdict] of [["action-like", "liked"], ["action-dislike", "disliked"]]) {
-    $(id)?.addEventListener("click", () => {
-      MyLists.opinion(lists(), symbol, verdict);
-      persistLists(); refresh();
-      renderListPanel();
-      announce(MyLists.has(lists(), verdict, symbol) ? `${symbol} marked ${verdict}` : `${symbol} cleared`);
-    });
-  }
-  $("action-add")?.addEventListener("click", () => {
-    const named = MyLists.listsOf(lists()).filter((list) => !list.builtin).map((list) => list.title);
-    const answer = window.prompt(`Add ${symbol} to which list?${named.length ? ` Existing: ${named.join(", ")}` : ""}`, named[0] || "Watchlist");
-    if (!answer) return;
-    const existing = MyLists.listsOf(lists()).find((list) => list.title === answer);
-    const id = existing ? existing.id : MyLists.createList(lists(), answer);
-    MyLists.add(lists(), id, { symbol }, { title: answer, kind: "custom" });
-    persistLists();
-    announce(`${symbol} added to ${answer}`);
-  });
+  const announce = (text) => { const node = $("action-status") || status;
+    if (node) node.textContent = text; };
   /* SPEC-AJ §1.5: a saved review decision. It is a note to yourself — stored in this
      browser under My Lists → Reviewed, carried by the local app's /api/lists sync, and
      nothing else. No AI verdict, no order, nothing leaves the page. */
@@ -2125,7 +2640,7 @@ function initStockActions(payload) {
     return { list: requested || (stored || {}).id || null, build_id: pageBuildId() || null };
   };
   const showReview = () => {
-    const saved = MyLists.reviewOf(lists(), symbol);
+    const saved = MyLists.reviewOf(lists(), actionSymbol);
     const node = $("review-state");
     if (node) {
       node.textContent = saved
@@ -2135,39 +2650,66 @@ function initStockActions(payload) {
     const select = $("review-decision");
     if (select && saved && saved.decision) select.value = saved.decision;
   };
+  refresh();
+  showReview();
+  // Bound once per page: the workspace re-points the same controls at the next symbol.
+  if (actionsBound) return;
+  actionsBound = true;
+  $("action-favorite")?.addEventListener("click", () => {
+    MyLists.toggle(lists(), "favorites", { symbol: actionSymbol });
+    persistLists(); refresh();
+    renderListPanel();
+    announce(MyLists.has(lists(), "favorites", actionSymbol) ? `${actionSymbol} added to Favorite Stocks` : `${actionSymbol} removed from Favorite Stocks`);
+  });
+  for (const [id, verdict] of [["action-like", "liked"], ["action-dislike", "disliked"]]) {
+    $(id)?.addEventListener("click", () => {
+      MyLists.opinion(lists(), actionSymbol, verdict);
+      persistLists(); refresh();
+      renderListPanel();
+      announce(MyLists.has(lists(), verdict, actionSymbol) ? `${actionSymbol} marked ${verdict}` : `${actionSymbol} cleared`);
+    });
+  }
+  $("action-add")?.addEventListener("click", () => {
+    const named = MyLists.listsOf(lists()).filter((list) => !list.builtin).map((list) => list.title);
+    const answer = window.prompt(`Add ${actionSymbol} to which list?${named.length ? ` Existing: ${named.join(", ")}` : ""}`, named[0] || "Watchlist");
+    if (!answer) return;
+    const existing = MyLists.listsOf(lists()).find((list) => list.title === answer);
+    const id = existing ? existing.id : MyLists.createList(lists(), answer);
+    MyLists.add(lists(), id, { symbol: actionSymbol }, { title: answer, kind: "custom" });
+    persistLists();
+    announce(`${actionSymbol} added to ${answer}`);
+  });
   $("action-review")?.addEventListener("click", () => {
     const decision = $("review-decision")?.value;
     if (!MyLists.DECISIONS.includes(decision)) {
       announce("Choose buy-plan, watch or pass before saving a decision.");
       return;
     }
-    const existing = MyLists.reviewOf(lists(), symbol);
-    const note = window.prompt(`Note for ${symbol} (optional)`, (existing || {}).note || "");
+    const existing = MyLists.reviewOf(lists(), actionSymbol);
+    const note = window.prompt(`Note for ${actionSymbol} (optional)`, (existing || {}).note || "");
     // Cancelled: the decision already saved for this symbol stands, unchanged.
     if (note === null) return;
-    MyLists.review(lists(), symbol, { decision, note, context: reviewContext() });
+    MyLists.review(lists(), actionSymbol, { decision, note, context: reviewContext() });
     persistLists();
     showReview();
     renderListPanel();
-    announce(`${symbol} reviewed · ${decision} (stored in this browser)`);
+    announce(`${actionSymbol} reviewed · ${decision} (stored in this browser)`);
   });
   $("action-position")?.addEventListener("click", () => {
-    const quantity = window.prompt(`Quantity of ${symbol}`, "");
+    const quantity = window.prompt(`Quantity of ${actionSymbol}`, "");
     if (quantity === null) return;
-    const price = window.prompt(`Average price paid for ${symbol}`, "");
+    const price = window.prompt(`Average price paid for ${actionSymbol}`, "");
     if (price === null) return;
     const date = window.prompt("Entry date (YYYY-MM-DD, optional)", new Date().toISOString().slice(0, 10));
-    const pattern = (payload.qualification || {}).pattern || {};
-    MyLists.add(lists(), "portfolio", { symbol }, { kind: "portfolio", title: "My Portfolio" });
-    MyLists.updateHolding(lists(), symbol, {
+    const pattern = (actionPayload.qualification || {}).pattern || {};
+    MyLists.add(lists(), "portfolio", { symbol: actionSymbol }, { kind: "portfolio", title: "My Portfolio" });
+    MyLists.updateHolding(lists(), actionSymbol, {
       qty: quantity, avg_price: price, entry_date: date,
       entry_pivot: pattern.pivot, entry_stop: pattern.stop, entry_buy_high: pattern.buy_zone_high,
     });
     persistLists();
-    announce(`${symbol} recorded in My Portfolio (${quantity} @ ${price})`);
+    announce(`${actionSymbol} recorded in My Portfolio (${quantity} @ ${price})`);
   });
-  refresh();
-  showReview();
 }
 
 /* ── §3 / §4 the browser-local pages ─────────────────────────────────────── */
@@ -2176,6 +2718,11 @@ function initStockActions(payload) {
 const portfolioView = Portfolio.renderers({ esc, fmt, signed, cls, url: siteUrl,
   stockUrl: (symbol) => Lists.stockHref(symbol, basePath(), routePages),
   contextUrl: (listId, symbol, index) => Lists.listLink(`my:${listId}`,
+    [String(symbol)], String(symbol), basePath(), { pages: routePages })
+    .replace(/&i=0$/, `&i=${index}`),
+  // SPEC-AK §1.4: a row of the reader's own list opens in the workspace with the same
+  // "my:" context, so Space walks Favorites exactly as it walks a published list.
+  chartUrl: (listId, symbol, index) => Lists.chartLink(`my:${listId}`,
     [String(symbol)], String(symbol), basePath(), { pages: routePages })
     .replace(/&i=0$/, `&i=${index}`) });
 
@@ -2438,6 +2985,7 @@ if (document.body.dataset.page === "technical") initTechnical();
 if (document.body.dataset.page === "list") initList();
 if (document.body.dataset.page === "user") initUserPage();
 if (document.body.dataset.page === "markets") initDeals();
+if (document.body.dataset.page === "chartview") initChartView();
 
 // Progressive web app: keeps the last snapshot readable offline and satisfies the
 // installability criteria the Android wrapper (Trusted Web Activity) expects.

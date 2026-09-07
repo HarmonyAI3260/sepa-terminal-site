@@ -530,6 +530,89 @@ input.blocked { outline: 2px solid #c78b35; outline-offset: 2px; }
     padding: var(--s3); }
 }
 
+/* ── the full-screen chart workspace (SPEC-AK) ──────────────────────────────
+   One viewport-filling grid: header strip, the figures row, then list panel · data
+   panel · chart, and a one-line status. Nothing here scrolls the document — each
+   column scrolls itself, so the chart keeps its height while the reader walks the list
+   with the space bar (and the browser's own full-screen state survives, because the
+   page is never reloaded). */
+body[data-page="chartview"] { overflow: hidden; }
+.chartview { display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; gap: var(--s2);
+  height: 100vh; height: 100dvh; padding: var(--s2) var(--s3); }
+.chartview-head { display: flex; flex-wrap: wrap; gap: var(--s3); align-items: flex-start;
+  justify-content: space-between; border-bottom: 1px solid var(--border-soft);
+  padding-bottom: var(--s2); }
+.chartview-id { min-width: 0; flex: 1 1 320px; }
+.chartview-id h1 { margin: 0; font: 700 1.15rem/1.2 var(--condensed); letter-spacing: .02em; }
+.chartview-exit { display: inline-block; margin-right: var(--s2); color: var(--blue);
+  font: .7rem var(--mono); text-decoration: none; }
+.chartview-meta { margin: 2px 0 0; color: var(--muted); font: .7rem var(--mono); }
+.chartview-meta a { color: var(--blue); }
+/* The description is one line until it is asked for; it never pushes the chart down. */
+.chartview-about { margin: 2px 0 0; max-width: 70ch; overflow: hidden; color: var(--faint);
+  font: .68rem/1.35 var(--sans); text-overflow: ellipsis; white-space: nowrap; }
+.chartview-about.expanded { overflow: auto; max-height: 6.5em; white-space: normal; }
+.chartview-controls { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; }
+.chartview-controls button, .chartview-search input { padding: 2px 9px;
+  border: 1px solid var(--border); border-radius: 4px; background: var(--panel-2);
+  color: var(--muted); font: .68rem var(--mono); cursor: pointer; }
+.chartview-controls button[aria-pressed="true"] { border-color: var(--mint); color: var(--mint); }
+.chartview-search { display: inline-flex; align-items: center; gap: var(--s1);
+  color: var(--muted); font: .66rem var(--mono); }
+.chartview-search input { width: 130px; color: var(--text); cursor: text; }
+body[data-page="chartview"] .stock-actions { display: flex; flex-wrap: wrap; gap: var(--s2);
+  align-items: center; }
+.chartview-figures { display: flex; flex-wrap: wrap; gap: var(--s3); overflow-x: auto;
+  border-bottom: 1px solid var(--border-soft); padding-bottom: var(--s2); }
+.chartview-figures div { display: flex; flex-direction: column; min-width: 84px; }
+.chartview-figures span { color: var(--muted); font: .58rem var(--condensed);
+  letter-spacing: .1em; text-transform: uppercase; }
+.chartview-figures b { font: 600 .82rem var(--mono); white-space: nowrap; }
+.chartview-figures em { color: var(--faint); font: .6rem var(--mono); font-style: normal; }
+.chartview-body { display: grid; grid-template-columns: 260px 280px minmax(0, 1fr);
+  gap: var(--s3); min-height: 0; }
+/* P hides the data column exactly as it hides the stock page's side panel. */
+.chartview-body.panel-hidden { grid-template-columns: 260px minmax(0, 1fr); }
+.chartview-body.panel-hidden .chartview-data { display: none; }
+.chartview-body > .list-panel { display: block; position: static; min-height: 0;
+  max-height: none; overflow-y: auto; border: 1px solid var(--border-soft);
+  border-radius: 8px; background: var(--panel-3); padding: var(--s3); }
+.chartview-data { min-height: 0; overflow-y: auto; display: flex; flex-direction: column;
+  gap: var(--s3); }
+.chartview-data .data-panel { max-height: none; }
+.chartview-chart { display: flex; flex-direction: column; gap: var(--s2); min-width: 0;
+  min-height: 0; overflow-y: auto; }
+.chartview-chart .chart-main { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }
+.chartview-chart #chart { min-height: 340px; flex: 1 1 auto; }
+.chartview-status { display: flex; flex-wrap: wrap; gap: var(--s3); align-items: baseline;
+  border-top: 1px solid var(--border-soft); padding-top: var(--s1); color: var(--muted);
+  font: .66rem var(--mono); }
+.chartview-status footer { border: 0; padding: 0; color: var(--faint); font: .66rem var(--mono); }
+.chartview-help { color: var(--faint); }
+#chartview-notes { color: var(--amber); }
+.chartview-disclaimer { color: var(--faint); }
+.chart-view-link { margin-left: 4px; color: var(--faint); font-size: .78em; text-decoration: none; }
+.chart-view-link:hover { color: var(--mint); }
+/* On a card the ⛶ is a corner control, not another block-level link: ``.list-card a`` is
+   the whole-card link and would otherwise give it the card's padding. */
+.list-card { position: relative; }
+.list-card > a.chart-view-link { position: absolute; top: 2px; right: 6px; z-index: 1;
+  display: inline; padding: 0; }
+.chart-fullscreen { align-self: center; color: var(--blue); font: .68rem var(--mono);
+  text-decoration: none; }
+/* Below 1120 px the list panel folds back into the drawer (L) and the data panel stacks
+   under the chart, exactly as the stock page does — nothing widens the document. */
+@media (max-width: 1120px) {
+  .chartview-body { grid-template-columns: minmax(0, 1fr); grid-auto-rows: minmax(0, auto);
+    overflow-y: auto; }
+  .chartview-body > .list-panel { display: none; }
+  .chartview-body.panel-hidden { grid-template-columns: minmax(0, 1fr); }
+  .chartview-data { order: 2; max-height: 420px; }
+  .chartview-chart { order: 1; }
+  .chartview { height: auto; min-height: 100vh; }
+  body[data-page="chartview"] { overflow: auto; }
+}
+
 /* Saved review decisions (SPEC-AJ §1.5). */
 .review-control { display: inline-flex; align-items: center; gap: var(--s1); }
 .review-label { color: var(--muted); font: .66rem var(--mono); }

@@ -277,12 +277,27 @@ const Lists = (() => {
     return `${href}${separator}list=${encodeURIComponent(listId)}${sort}&i=${index}`;
   }
 
+  /* The same link, pointed at the full-screen chart workspace (SPEC-AK). One published
+     page serves every scanned symbol, so — unlike ``listLink`` — the destination does not
+     depend on which route the symbol owns; the list, the sort and the index travel with
+     it so Space keeps walking the order the reader is looking at. */
+  function chartLink(listId, symbols, symbol, basePath = "", options = {}) {
+    const key = String(symbol === null || symbol === undefined ? "" : symbol);
+    const href = `${basePath}/chart/?symbol=${encodeURIComponent(key)}`;
+    const index = (symbols || []).indexOf(symbol);
+    if (!listId || index === -1) return href;
+    const sort = options.sort && options.sort.key
+      ? `&sort=${encodeURIComponent(`${options.sort.key}:${options.sort.direction === "asc" ? "asc" : "desc"}`)}`
+      : "";
+    return `${href}&list=${encodeURIComponent(listId)}${sort}&i=${index}`;
+  }
+
   return {
     contractVersion: LISTS_CONTRACT_VERSION, PAGE_SIZE, cellValue, formatCell, compare, sortRows,
     defaultDirection, sortOptions, sparkPath, cardModel, csvCell, csv, csvColumns, page,
     membershipReason,
     COMPOSITE_PARTIAL_MARK, COMPOSITE_PARTIAL_TITLE, compositeBasis, compositeCell,
-    pageOf, stockHref, listLink,
+    pageOf, stockHref, listLink, chartLink,
   };
 })();
 if (typeof module !== "undefined" && module.exports) module.exports = Lists;

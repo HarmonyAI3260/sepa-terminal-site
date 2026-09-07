@@ -756,6 +756,10 @@ const MSChart = (() => {
     if (TIMEFRAMES.includes(upper)) return `timeframe:${upper}`;
     if (upper === "P") return "panel";
     if (upper === "L") return "list";
+    // SPEC-AK §1.4: F opens the full-screen chart workspace from a stock route, and
+    // toggles the browser's native full screen inside the workspace itself.
+    if (upper === "F") return "fullscreen";
+    if (key === "/") return "search";
     if (/^[1-9]$/.test(upper)) return `tab:${Number(upper)}`;
     return null;
   }
