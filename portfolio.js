@@ -21,6 +21,19 @@ const Portfolio = (() => {
   const NO_EPS_CALENDAR = "n/a (no results-calendar feed)";
   const AI_EVALUATION_LIMIT = 8;
 
+  /* Display names for the ratings a portfolio card shows: an exact mirror of
+     core/ratings.LABELS (the Python map is the source; a parity test compares the two),
+     so a holding names a rating exactly as the stock page does. */
+  const RATING_LABELS = {
+    composite: "SEPA Composite (custom)",
+    composite_full: "SEPA Composite (full-evidence)",
+    eps_rating: "SEPA EPS score",
+    rs_rating: "SEPA RS percentile",
+    ad_rating: "SEPA A/D proxy",
+    group_rank: "SEPA Group Rank",
+    eps_growth_rate: "SEPA EPS growth rate",
+    earnings_stability: "SEPA earnings stability",
+  };
   const finite = (value) => typeof value === "number" && Number.isFinite(value);
   const number = (value) => {
     if (value === null || value === undefined || value === "") return null;
@@ -137,7 +150,10 @@ const Portfolio = (() => {
       buy_range: buyRange(item),
       addition_date: item.entry_date || (item.added_at ? String(item.added_at).slice(0, 10) : null),
       ratings: { composite: ratingsOf(row).composite ?? null, rs: ratingsOf(row).rs ?? null,
-        eps: ratingsOf(row).eps ?? null, ad: ratingsOf(row).ad ?? null },
+        eps: ratingsOf(row).eps ?? null, ad: ratingsOf(row).ad ?? null,
+        // B1: the composite never travels without the input set behind it.
+        composite_basis: ratingsOf(row).composite_basis ?? null,
+        composite_full: ratingsOf(row).composite_full ?? null },
       stage: (row || {}).stage || null,
       group: ((row || {}).group || {}).name || null,
       group_rank: ((row || {}).group || {}).rank ?? null,
@@ -540,6 +556,13 @@ const Portfolio = (() => {
         : '<span class="positive">not triggered</span>';
     }
 
+    /* ``88 P`` — the composite with its basis, the same mark the list tables use. */
+    function compositeText(ratings) {
+      const value = (ratings || {}).composite;
+      if (value === null || value === undefined || !finite(Number(value))) return "–";
+      return `${fmt(value, 0)}${(ratings || {}).composite_basis === "partial" ? " P" : ""}`;
+    }
+
     function holdingsTable(cards) {
       if (!cards.length) {
         return `<p class="list-empty">No positions yet. Open a stock page and use "Record position…", `
@@ -552,7 +575,7 @@ const Portfolio = (() => {
         <td>${esc(card.buy_range.text)}${card.buy_range.reason
           ? `<small class="muted"> ${esc(card.buy_range.reason)}</small>` : ""}</td>
         <td>${esc(card.addition_date || "–")}</td>
-        <td>${fmt(card.ratings.composite, 0)}/${fmt(card.ratings.rs, 0)}/${fmt(card.ratings.eps, 0)}/${esc(card.ratings.ad || "–")}</td>
+        <td title="P = partial input set">${esc(compositeText(card.ratings))}/${fmt(card.ratings.rs, 0)}/${fmt(card.ratings.eps, 0)}/${esc(card.ratings.ad || "–")}</td>
         <td>${esc(card.eps_due)}</td><td>${sellCell(card)}</td></tr>`).join("");
       return `<div class="detail-table-wrap"><table class="detail-table"><thead><tr>
         <th>Symbol</th><th>Name</th><th>CMP</th><th>1D %</th><th>Qty</th><th>Avg price</th><th>Gain %</th>
@@ -571,7 +594,7 @@ const Portfolio = (() => {
         <td>${money(entry.pivot)}</td><td>${money(entry.buy_zone_high)}</td><td>${money(entry.stop)}</td>
         <td>${fmt(entry.pct_to_pivot, 1)}%</td>
         <td>${esc(String(entry.base_status).replace(/_/g, " "))}</td>
-        <td>${fmt(entry.ratings.composite, 0)}/${fmt(entry.ratings.rs, 0)}/${fmt(entry.ratings.eps, 0)}</td>
+        <td title="P = partial input set">${esc(compositeText(entry.ratings))}/${fmt(entry.ratings.rs, 0)}/${fmt(entry.ratings.eps, 0)}</td>
         </tr>`).join("");
       return `<div class="detail-table-wrap"><table class="detail-table"><thead><tr>
         <th>Symbol</th><th>Name</th><th>Source</th><th>Price</th><th>1D %</th><th>Pivot</th>
@@ -642,7 +665,10 @@ const Portfolio = (() => {
         <p class="muted">${esc(card.name)}${card.unresolved_reason ? ` — ${esc(card.unresolved_reason)}` : ""}
           ${card.lots > 1 ? `<small>lots: ${card.lots}</small>` : ""}</p>
         <dl>
-          <div><dt>Composite</dt><dd>${fmt(card.ratings.composite, 0)}</dd></div>
+          <div><dt>${esc(RATING_LABELS.composite)}</dt>
+            <dd title="P = partial input set">${esc(compositeText(card.ratings))}</dd></div>
+          <div><dt>${esc(RATING_LABELS.composite_full)}</dt>
+            <dd>${fmt(card.ratings.composite_full, 0)}</dd></div>
           <div><dt>RS</dt><dd>${fmt(card.ratings.rs, 0)}</dd></div>
           <div><dt>EPS</dt><dd>${fmt(card.ratings.eps, 0)}</dd></div>
           <div><dt>A/D</dt><dd>${esc(card.ratings.ad || "–")}</dd></div>
@@ -695,7 +721,7 @@ const Portfolio = (() => {
   return {
     contractVersion: PORTFOLIO_CONTRACT_VERSION, GRADE_BANDS, STOCK_WEIGHTS, PORTFOLIO_WEIGHTS,
     STAGE_POINTS, ENTRY_POINTS, CONCENTRATION_LIMIT, GROUP_LIMIT, STOP_LOSS_PCT,
-    NO_EPS_CALENDAR, AI_EVALUATION_LIMIT,
+    NO_EPS_CALENDAR, AI_EVALUATION_LIMIT, RATING_LABELS,
     grade, stageNumber, index, sellRules, stopOf, gainPct, distanceToStop, buyRange,
     holdingCard, currentHoldings, sellWatchlist, buyWatchlist, stockScore, action,
     concentration, evaluate, mergeHoldings, quantityReason, parseHoldings, renderers,

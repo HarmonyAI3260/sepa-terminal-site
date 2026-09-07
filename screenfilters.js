@@ -21,10 +21,18 @@ const ScreenFilters = (() => {
     ma50_above_150_200: { id: 4, label: "50d MA above the 150d and 200d MA" },
     price_above_50: { id: 5, label: "Price above the 50d MA" },
   };
-  const BASE_STATUSES = ["forming", "near_pivot", "breakout", "extended", "failed", "none"];
-  const LIFECYCLE_STATES = ["forming", "confirmed", "triggered", "extended", "failed", "invalidated"];
+  /* B2: these three vocabularies are exact copies of the constants the generator emits
+     (core/ta.BASE_STATUSES, core/ta.LIFECYCLE_STATES, core/readiness.ENTRY_STATES); a
+     Python test parses them out of this file and compares them element by element. A menu
+     may never offer a state the scan cannot publish. */
+  const BASE_STATUSES = ["none", "forming", "near_pivot", "breakout", "extended", "failed"];
+  const LIFECYCLE_STATES = ["geometry_observed", "trend_qualified", "forming", "near_pivot",
+    "triggered", "extended", "failed", "invalidated"];
+  const ENTRY_STATES = ["none", "forming", "near", "triggered", "extended", "failed"];
+  const readable = (value) => String(value).replace(/_/g, " ");
   const SURVEILLANCE_FLAGS = [
-    ["asm", "ASM"], ["gsm", "GSM"], ["high_debt", "High debt"],
+    ["asm", "ASM criteria match (broker master)"], ["gsm", "GSM criteria match (broker master)"],
+    ["high_debt", "High debt"],
     ["low_institutional", "No or limited institutional holding"],
     ["high_pledge", "High promoter pledging"], ["low_liquidity", "Low liquidity"],
     ["heavy_institutional_selling", "Heavy institutional selling"], ["sme", "SME"],
@@ -34,6 +42,20 @@ const ScreenFilters = (() => {
     ["niftytotalmarket", "Nifty Total Market"], ["niftymicrocap250", "Nifty Microcap 250"]];
 
   const finite = (value) => typeof value === "number" && Number.isFinite(value);
+  /* The core screener's own freshness rule, called — never re-implemented. In the browser
+     ``Screener`` is a global; in Node the module is required. With neither available a
+     quarterly filter reads "unknown", which is the fail-closed answer. */
+  const core = (typeof Screener !== "undefined" && Screener)
+    || ((typeof module !== "undefined" && typeof require === "function")
+      ? require("./screener.js") : null);
+  const usableFund = (row) =>
+    !!(core && typeof core.usableFund === "function" && core.usableFund(row));
+  const fundStale = (row) => !!(row && row.fund && row.fund.stale === true);
+  /* A quarter-based figure is only readable while the core would accept the quarter it
+     came from; an annual or balance-sheet figure keeps annual frequency and is withheld
+     only when the whole financial record is stale. */
+  const quarterly = (read) => (row) => (usableFund(row) ? read(row) : null);
+  const annual = (read) => (row) => (fundStale(row) ? null : read(row));
   const num = (value) => (finite(value) ? value : (value === null || value === undefined || value === ""
     ? null : (Number.isFinite(Number(value)) ? Number(value) : null)));
   const ratings = (row) => (row && row.ratings) || {};
@@ -99,31 +121,51 @@ const ScreenFilters = (() => {
     { id: "fundamental", title: "Fundamental",
       note: "Year-on-year growth comes from the latest reported quarter. This build "
         + "publishes no rolling four-quarter growth rate, so a TTM *growth* filter is not "
-        + "offered; the TTM sales figure itself is.",
+        + "offered; the TTM sales figure itself is. Quarter-based figures (sales, EPS, PAT, "
+        + "operating margin) read 'unknown' unless the core screener would accept that "
+        + "quarter — the record must not be stale and its status must be current or "
+        + "lagging. Annual and balance-sheet figures (market cap, P/E, ROE, debt/equity, "
+        + "yield, TTM sales) keep annual frequency: they are withheld only when the whole "
+        + "financial record is stale, never aged out by a quarterly cutoff.",
       filters: [
-        { id: "sales_yoy_min", label: "Sales YoY ≥ (%)", kind: "min", read: (row) => num(fund(row).sales_yoy) },
-        { id: "eps_yoy_min", label: "EPS YoY ≥ (%)", kind: "min", read: (row) => num(fund(row).eps_yoy) },
-        { id: "pat_yoy_min", label: "PAT YoY ≥ (%)", kind: "min", read: (row) => num(fund(row).pat_yoy) },
+        { id: "sales_yoy_min", label: "Sales YoY ≥ (%)", kind: "min",
+          read: quarterly((row) => num(fund(row).sales_yoy)) },
+        { id: "eps_yoy_min", label: "EPS YoY ≥ (%)", kind: "min",
+          read: quarterly((row) => num(fund(row).eps_yoy)) },
+        { id: "pat_yoy_min", label: "PAT YoY ≥ (%)", kind: "min",
+          read: quarterly((row) => num(fund(row).pat_yoy)) },
         { id: "sales_ttm_min", label: "Sales TTM ≥ (₹ Cr)", kind: "min",
-          read: (row) => num(facts(row).sales_ttm_cr) },
-        { id: "opm_min", label: "Operating margin ≥ (%)", kind: "min", read: (row) => num(fund(row).opm_pct) },
-        { id: "roe_min", label: "Return on equity ≥ (%)", kind: "min", read: (row) => num(facts(row).roe_pct) },
-        { id: "de_max", label: "Debt / equity ≤ (%)", kind: "max", read: (row) => num(facts(row).ltdebt_equity_pct) },
+          read: annual((row) => num(facts(row).sales_ttm_cr)) },
+        { id: "opm_min", label: "Operating margin ≥ (%)", kind: "min",
+          read: quarterly((row) => num(fund(row).opm_pct)) },
+        { id: "roe_min", label: "Return on equity ≥ (%)", kind: "min",
+          read: annual((row) => num(facts(row).roe_pct)) },
+        { id: "de_max", label: "Debt/Equity (total borrowings) ≤ (%)", kind: "max",
+          read: annual((row) => num(facts(row).ltdebt_equity_pct)) },
         { id: "yield_min", label: "Dividend yield ≥ (%)", kind: "min",
-          read: (row) => num(facts(row).dividend_yield_pct) },
-        { id: "mcap_min", label: "Market cap ≥ (₹ Cr)", kind: "min", read: (row) => num(facts(row).market_cap_cr) },
-        { id: "mcap_max", label: "Market cap ≤ (₹ Cr)", kind: "max", read: (row) => num(facts(row).market_cap_cr) },
-        { id: "pe_max", label: "P/E ≤", kind: "max", read: (row) => num(facts(row).pe) },
-        { id: "pe_min", label: "P/E ≥", kind: "min", read: (row) => num(facts(row).pe) },
+          read: annual((row) => num(facts(row).dividend_yield_pct)) },
+        { id: "mcap_min", label: "Market cap ≥ (₹ Cr)", kind: "min",
+          read: annual((row) => num(facts(row).market_cap_cr)) },
+        { id: "mcap_max", label: "Market cap ≤ (₹ Cr)", kind: "max",
+          read: annual((row) => num(facts(row).market_cap_cr)) },
+        { id: "pe_max", label: "P/E ≤", kind: "max", read: annual((row) => num(facts(row).pe)) },
+        { id: "pe_min", label: "P/E ≥", kind: "min", read: annual((row) => num(facts(row).pe)) },
       ] },
-    { id: "pattern", title: "Pattern", note: null, filters: [
-      { id: "base_status", label: "Base status", kind: "multi",
-        options: BASE_STATUSES.map((value) => ({ value, label: value.replace(/_/g, " ") })),
+    { id: "pattern", title: "Pattern",
+      note: "Three vocabularies, kept apart: the base's geometry status, the geometry "
+        + "lifecycle state and the readiness entry state. A near-pivot shape is not "
+        + "automatically Ready, and each menu is generated from the constant the scan "
+        + "publishes.",
+      filters: [
+      { id: "base_status", label: "Base status (weekly geometry)", kind: "multi",
+        vocabulary: "base status", vocabularyKey: "base_statuses",
+        options: BASE_STATUSES.map((value) => ({ value, label: readable(value) })),
         read: (row) => String(base(row).status || "none"),
         test: (value, read) => (read === null ? null
           : (Array.isArray(value) ? value : [value]).includes(read)) },
-      { id: "lifecycle", label: "Lifecycle state", kind: "multi",
-        options: LIFECYCLE_STATES.map((value) => ({ value, label: value })),
+      { id: "lifecycle", label: "Lifecycle state (base geometry)", kind: "multi",
+        vocabulary: "lifecycle state", vocabularyKey: "lifecycle_states",
+        options: LIFECYCLE_STATES.map((value) => ({ value, label: readable(value) })),
         read: (row) => base(row).lifecycle_state || qualification(row).lifecycle_state || null,
         test: (value, read) => (read === null ? null
           : (Array.isArray(value) ? value : [value]).includes(String(read))) },
@@ -132,13 +174,13 @@ const ScreenFilters = (() => {
         read: (row) => boolean(base(row).vcp_trend_qualified) },
       { id: "power_play", label: "Power play", kind: "bool",
         read: (row) => boolean((row.power_play || {}).flag) },
-      { id: "near_pivot", label: "Near the pivot", kind: "bool",
+      { id: "near_pivot", label: "Entry state: near (readiness)", kind: "bool",
         read: (row) => (qualification(row).entry_state ? qualification(row).entry_state === "near" : null) },
-      { id: "breakout", label: "Breakout (triggered)", kind: "bool",
+      { id: "breakout", label: "Entry state: triggered (readiness)", kind: "bool",
         read: (row) => (qualification(row).entry_state ? qualification(row).entry_state === "triggered" : null) },
-      { id: "extended", label: "Extended", kind: "bool",
+      { id: "extended", label: "Entry state: extended (readiness)", kind: "bool",
         read: (row) => (qualification(row).entry_state ? qualification(row).entry_state === "extended" : null) },
-      { id: "failed", label: "Failed", kind: "bool",
+      { id: "failed", label: "Entry state: failed (readiness)", kind: "bool",
         read: (row) => (qualification(row).entry_state ? qualification(row).entry_state === "failed" : null) },
       { id: "in_base", label: "In a base", kind: "bool", read: (row) => boolean(base(row).in_base) },
       { id: "ready", label: "Readiness approved", kind: "bool",
@@ -154,9 +196,15 @@ const ScreenFilters = (() => {
             : (Array.isArray(value) ? value : [value]).some((key) => read.includes(key))) },
       ] },
     { id: "surveillance", title: "Surveillance",
-      note: "Exchange and balance-sheet flags as published on the stock page.",
+      note: "ASM/GSM are criteria matches from the broker symbol master, not official NSE "
+        + "designations; official status is unknown for every row in this build. Every "
+        + "other flag is this project's own balance-sheet or liquidity heuristic.",
       filters: SURVEILLANCE_FLAGS.map(([key, label]) => ({
-        id: `surv_${key}`, label, kind: "state", options: ["flagged", "clear"],
+        id: `surv_${key}`, label, kind: "state", vocabulary: "surveillance state",
+        // The stored values never change (saved screens keep working); only what the
+        // reader is shown does: a criteria match is not an official designation.
+        options: [{ value: "flagged", label: key === "asm" || key === "gsm" ? "match" : "flagged" },
+          { value: "clear", label: key === "asm" || key === "gsm" ? "no match" : "clear" }],
         read: (row) => boolean(((row.surveillance || {})[key])),
         test: (value, read) => (read === null ? null : (value === "flagged" ? read === true : read === false)),
       })) },
@@ -171,8 +219,10 @@ const ScreenFilters = (() => {
     return {};
   }
 
-  /* Only known filter ids with a usable value survive; everything else is dropped so a
-     stale or hand-edited saved screen can never mean something the page cannot show. */
+  /* Only known filter ids survive, and a numeric filter still needs a number. An
+     enumerated value this build does not publish is *kept*, not dropped: a saved screen
+     that asks for a state this snapshot cannot answer must stay a restriction and be
+     blocked with its reason (B2), never silently widened into "any". */
   function normalize(state) {
     const clean = {};
     for (const [id, value] of Object.entries(state || {})) {
@@ -181,18 +231,50 @@ const ScreenFilters = (() => {
       if (filter.kind === "bool") {
         if (value === true) clean[id] = true;
       } else if (filter.kind === "multi") {
-        const options = new Set((filter.options || []).map((option) => option.value ?? option));
-        const chosen = [...new Set((Array.isArray(value) ? value : [value]).map(String))]
-          .filter((entry) => options.has(entry)).sort();
+        const chosen = [...new Set((Array.isArray(value) ? value : [value])
+          .filter((entry) => entry !== null && entry !== undefined && entry !== "").map(String))].sort();
         if (chosen.length) clean[id] = chosen;
       } else if (filter.kind === "choice" || filter.kind === "state") {
-        const options = (filter.options || []).map((option) => option.value ?? option);
-        if (options.includes(String(value))) clean[id] = String(value);
+        if (value !== null && value !== undefined && value !== "") clean[id] = String(value);
       } else {
         const parsed = num(value);
         if (parsed !== null) clean[id] = parsed;
       }
     }
+    return clean;
+  }
+
+  /* The values this snapshot can actually answer for one enumerated filter: the shared
+     vocabulary, narrowed to what the published meta says the build emits. */
+  function allowedValues(filter, meta) {
+    const options = (filter.options || []).map((option) => String(option.value ?? option));
+    const published = ((meta || {}).enums || {})[filter.vocabularyKey];
+    if (Array.isArray(published) && published.length) {
+      return options.filter((value) => published.includes(value));
+    }
+    return options;
+  }
+
+  function unsupportedValues(filter, value, meta) {
+    if (!filter || !["multi", "choice", "state"].includes(filter.kind)) return [];
+    const allowed = allowedValues(filter, meta);
+    return (Array.isArray(value) ? value : [value]).map(String)
+      .filter((entry) => !allowed.includes(entry));
+  }
+
+  /* Strip exactly the values a blocked entry named, leaving the rest of the condition
+     intact — the "Remove condition" control never quietly drops a supported restriction. */
+  function removeUnsupported(state, id, values) {
+    const clean = { ...normalize(state) };
+    const filter = FILTERS.get(id);
+    const drop = new Set((values || []).map(String));
+    if (!filter || !drop.size) { delete clean[id]; return clean; }
+    if (filter.kind === "multi") {
+      const kept = (Array.isArray(clean[id]) ? clean[id] : []).filter((entry) => !drop.has(String(entry)));
+      if (kept.length) clean[id] = kept; else delete clean[id];
+      return clean;
+    }
+    if (drop.has(String(clean[id]))) delete clean[id];
     return clean;
   }
 
@@ -233,7 +315,22 @@ const ScreenFilters = (() => {
     const rows = (data && data.rows) || [];
     const meta = (data && data.meta) || {};
     const blocked = [];
-    for (const { filter } of active(state)) {
+    for (const { filter, value } of active(state)) {
+      // A value outside the published vocabulary blocks the screen and says which value
+      // and which vocabulary — it can never match everything or nothing in silence.
+      const unsupported = unsupportedValues(filter, value, meta);
+      if (unsupported.length) {
+        const allowed = allowedValues(filter, meta);
+        const noun = filter.vocabulary || "supported value";
+        const named = unsupported.map((entry) => `'${entry}'`).join(", ");
+        blocked.push({ key: filter.id, label: filter.label, unsupported,
+          reason: unsupported.length === 1
+            ? `value ${named} is not a ${noun} this snapshot publishes `
+              + `(allowed: ${allowed.join(", ")})`
+            : `values ${named} are not ${noun}s this snapshot publishes `
+              + `(allowed: ${allowed.join(", ")})` });
+        continue;
+      }
       if (filter.category === "indices") {
         const membership = meta.index_membership || {};
         if (membership.available === false || (!membership.available && !rows.some((row) => (row.indices || []).length))) {
@@ -399,6 +496,7 @@ const ScreenFilters = (() => {
   return {
     contractVersion: SCREENFILTERS_CONTRACT_VERSION, SAVED_KEY, SAVED_VERSION, CATEGORIES,
     FILTERS, AD_ORDER, MA_TESTS, SURVEILLANCE_FLAGS, INDEX_KEYS, BASE_STATUSES, LIFECYCLE_STATES,
+    ENTRY_STATES, allowedValues, unsupportedValues, removeUnsupported, usableFund,
     defaults, normalize, active, evaluate, verdict, matches, availability, coverage,
     coverageText, describe, controlHtml, categoriesHtml, readControls, escapeHtml,
     loadSaved, saveSaved, saveScreen, deleteScreen, getScreen,

@@ -454,6 +454,8 @@ input.blocked { outline: 2px solid #c78b35; outline-offset: 2px; }
 .site-sidebar li a:hover { background: var(--panel-2); }
 .site-sidebar li a[aria-current="page"] { background: var(--panel-2); color: var(--mint); }
 .side-count, .side-soon { color: var(--faint); font: .66rem var(--mono); }
+.side-count-unavailable { color: var(--amber); }
+.list-unavailable { color: var(--amber); font: .78rem var(--sans); }
 .side-more { display: inline-block; margin-top: var(--s2); color: var(--blue); font: .7rem var(--mono); }
 .sidebar-toggle { display: none; width: 100%; }
 @media (max-width: 900px) {
@@ -522,10 +524,29 @@ input.blocked { outline: 2px solid #c78b35; outline-offset: 2px; }
 .chart-tools button, .timeframe button { padding: 2px 9px; border: 1px solid var(--border); border-radius: 4px;
   background: var(--panel-2); color: var(--muted); font: .68rem var(--mono); cursor: pointer; }
 .chart-tools button[aria-pressed="true"], .timeframe button[aria-pressed="true"] { border-color: var(--mint); color: var(--mint); }
-.timeframe, .draw-tools { display: flex; gap: var(--s1); }
+/* Every control group wraps: at 375 px the drawing tools alone are wider than the
+   viewport, and a chart toolbar must never widen the document (SPEC-AH §5). */
+.timeframe, .draw-tools, .ma-tools { display: flex; flex-wrap: wrap; gap: var(--s1);
+  align-items: center; max-width: 100%; }
+.ma-tools .ma-label { color: var(--muted); font: .66rem var(--mono); }
+.ma-toggle { display: inline-flex; align-items: center; gap: 3px; color: var(--muted);
+  font: .68rem var(--mono); cursor: pointer; }
+.chart-legend { display: flex; flex-wrap: wrap; gap: var(--s2); }
+.list-nav, .stock-back, .chart-status, .user-actions, .row-actions,
+.stock-actions, .list-controls { flex-wrap: wrap; }
+/* Nothing inside the shell may be wider than the shell: wide tables scroll inside their
+   own bounded container, and no toolbar, hero or form control widens the document. */
+.shell, .list-shell, .stock-shell, main, .stock-hero, .chart-main, .card { min-width: 0; }
+textarea, input, select { max-width: 100%; }
 #chart { position: relative; }
 .draw-overlay { position: absolute; inset: 0; pointer-events: none; }
 .draw-overlay.drawing { pointer-events: auto; cursor: crosshair; }
+.draw-overlay.dragging { pointer-events: auto; cursor: grabbing; }
+/* In select mode the overlay ignores the pointer so the chart keeps its own pan and zoom;
+   only the invisible, wider "hit" twins of each stroke (and text notes) can be grabbed. */
+.draw-overlay .hit { pointer-events: stroke; stroke: transparent; stroke-width: 12; fill: none; cursor: grab; }
+.draw-overlay rect.hit { pointer-events: visiblePainted; fill: transparent; }
+.draw-overlay text { pointer-events: visiblePainted; cursor: grab; }
 .rs-line { color: var(--mint); }
 
 .list-head h1 { margin: var(--s1) 0; }

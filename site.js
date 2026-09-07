@@ -309,8 +309,24 @@ function renderRows(resetPage = true) {
       const button = document.createElement("button");
       button.id = `scan-remove-${item.key}`;
       button.type = "button"; button.textContent = "Remove condition";
-      button.title = `Remove ${item.label}`;
-      button.addEventListener("click", () => { filters[item.key] = false; saveFilters(); renderRows(); });
+      // A category block names the values this snapshot cannot answer; removing it strips
+      // exactly those and leaves the rest of the condition standing (SPEC-AH §2.1).
+      button.title = item.unsupported && item.unsupported.length
+        ? `Remove ${item.unsupported.join(", ")} from ${item.label}` : `Remove ${item.label}`;
+      button.addEventListener("click", () => {
+        if (ScreenFilters.FILTERS.has(item.key)) {
+          categories = item.unsupported && item.unsupported.length
+            ? ScreenFilters.removeUnsupported(categories, item.key, item.unsupported)
+            : (() => { const next = { ...ScreenFilters.normalize(categories) };
+              delete next[item.key]; return next; })();
+          saveCategories();
+          renderCategoryControls();
+        } else {
+          filters[item.key] = false;
+          saveFilters();
+        }
+        renderRows();
+      });
       $("scan-count").appendChild(button);
     }
   } else if (!visibleRows.length) {
@@ -563,7 +579,7 @@ function readListParams() {
   const id = params.get("list");
   const index = Number.parseInt(params.get("i"), 10);
   const sort = parseSortParam(params.get("sort"));
-  if (id) return { id, index: Number.isInteger(index) ? index : -1, sort, fallback: false };
+  if (id) return { id, index: Number.isInteger(index) ? index : -1, sort, fallback: false, source: "url" };
   try {
     const stored = JSON.parse(sessionStorage.getItem(LIST_CONTEXT_KEY) || "null");
     // A session entry from another contract version or another build is discarded, not
@@ -572,10 +588,10 @@ function readListParams() {
       && (!stored.build_id || !pageBuildId() || stored.build_id === pageBuildId());
     if (usable) {
       return { id: stored.id, index: Number.isInteger(stored.index) ? stored.index : -1,
-        sort: MSChart.listSort(stored.sort), fallback: false };
+        sort: MSChart.listSort(stored.sort), fallback: false, source: "session" };
     }
   } catch { /* a corrupt session entry is simply no context */ }
-  return { id: DEFAULT_LIST, index: -1, sort: null, fallback: true };
+  return { id: DEFAULT_LIST, index: -1, sort: null, fallback: true, source: "default" };
 }
 
 async function loadListContext(symbol) {
@@ -591,6 +607,7 @@ async function loadListContext(symbol) {
         build_id: pageBuildId(), symbols: list.items.map((item) => item.symbol),
         index: requested.index, sort: requested.sort, pages }, symbol);
       context.fallback = false;
+      rememberListContext(context, requested);
       return context;
     }
     return { version: MSChart.LIST_CONTEXT_VERSION, id: null, title: null, symbols: [], index: -1,
@@ -618,12 +635,26 @@ async function loadListContext(symbol) {
         unresolved: payload.missing_symbols || [] },
       symbol);
     context.fallback = requested.fallback;
+    rememberListContext(context, requested);
     return context;
   } catch {
     return { version: MSChart.LIST_CONTEXT_VERSION, id: null, title: null, symbols: [], index: -1,
       position: null, sort: null, pages: null, unresolved: [], fallback: true,
       error: `list ${requested.id} is not published in this snapshot` };
   }
+}
+
+/* A list context that arrived in the URL becomes this tab's context, so a link that
+   carries no list parameters (Related, Top RS in group, a search result) keeps walking
+   the list the reader was reading instead of an older one. */
+function rememberListContext(context, requested) {
+  if (!context || !context.id || context.index === -1 || (requested || {}).source !== "url") return;
+  try {
+    sessionStorage.setItem(LIST_CONTEXT_KEY, JSON.stringify({
+      version: MSChart.LIST_CONTEXT_VERSION, id: context.id, sort: context.sort,
+      index: context.index, build_id: pageBuildId(),
+    }));
+  } catch { /* private mode: the query string still carries the context */ }
 }
 
 function renderListNav(context) {
@@ -736,6 +767,49 @@ async function initStock() {
   await initChart(config, context, { container, move, gotoTab });
 }
 
+/* The reader's moving-average selection, per timeframe. Display state only. */
+function loadMaPeriods() {
+  try { return JSON.parse(localStorage.getItem(MSChart.MA_STORAGE_KEY) || "null"); }
+  catch { return null; }
+}
+
+function saveMaPeriods(store) {
+  try { localStorage.setItem(MSChart.MA_STORAGE_KEY, JSON.stringify(store || {})); }
+  catch { /* private mode: the selection still applies for this session */ }
+}
+
+/* The chart's frame colours come from the stylesheet's own variables, read at creation
+   and again on every theme switch (SPEC-AH §5). Candles and markers keep their fixed
+   palette: they encode direction and events, not the surface they sit on. */
+function cssVariable(name, fallback) {
+  try {
+    const style = getComputedStyle(document.documentElement);
+    const value = String(style.getPropertyValue(name) || "").trim();
+    return value || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function themedChartOptions() {
+  const background = cssVariable("--bg", "#0b0f14");
+  const text = cssVariable("--text", "#e6edf5");
+  const muted = cssVariable("--muted", "#8a97a8");
+  const border = cssVariable("--border", "#2a3542");
+  const grid = cssVariable("--border-soft", border);
+  return {
+    layout: { background: { color: background }, textColor: muted,
+      fontFamily: "IBM Plex Mono, monospace" },
+    grid: { vertLines: { color: grid }, horzLines: { color: grid } },
+    rightPriceScale: { borderColor: border },
+    timeScale: { borderColor: border },
+    // The crosshair chip takes the foreground colour as its ground; the library picks the
+    // contrasting text, so it stays readable in both themes.
+    crosshair: { vertLine: { color: muted, labelBackgroundColor: text },
+      horzLine: { color: muted, labelBackgroundColor: text } },
+  };
+}
+
 /* One chart initialiser for both stock routes (SPEC-AG §4.3).
 
    ``config`` is the full page's ``#stock-data`` payload or the equivalent assembled from
@@ -802,14 +876,15 @@ async function initChart(config, context, mount = {}) {
   const overlay = $("draw-overlay");
   const band = container.querySelector(".buy-zone-band");
   const chart = LightweightCharts.createChart(host, {
-    layout: { background: { color: "transparent" }, textColor: "#8a97a8", fontFamily: "IBM Plex Mono, monospace" },
-    grid: { vertLines: { color: "#1d2733" }, horzLines: { color: "#1d2733" } },
-    rightPriceScale: { borderColor: "#2a3542", scaleMargins: { top: 0.08, bottom: 0.18 },
-      mode: LightweightCharts.PriceScaleMode.Logarithmic },
-    timeScale: { borderColor: "#2a3542", timeVisible: false, rightOffset: 4 },
-    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    ...themedChartOptions(),
+    rightPriceScale: { ...themedChartOptions().rightPriceScale,
+      scaleMargins: { top: 0.08, bottom: 0.18 }, mode: LightweightCharts.PriceScaleMode.Logarithmic },
+    timeScale: { ...themedChartOptions().timeScale, timeVisible: false, rightOffset: 4 },
+    crosshair: { ...themedChartOptions().crosshair, mode: LightweightCharts.CrosshairMode.Normal },
     height: Math.max(460, container.clientHeight), autoSize: true,
   });
+  // Repaint the frame (not the candles) whenever the theme changes.
+  onThemeChange(() => chart.applyOptions(themedChartOptions()));
   const candles = chart.addCandlestickSeries({
     upColor: "#4da3ff", downColor: "#ff5fa2", wickUpColor: "#4da3ff", wickDownColor: "#ff5fa2",
     borderVisible: false,
@@ -818,8 +893,10 @@ async function initChart(config, context, mount = {}) {
   chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
   const volumeAverage = chart.addLineSeries({ priceScaleId: "vol", color: "#f5a623", lineWidth: 1,
     priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
-  const maSeries = [0, 1, 2].map(() => chart.addLineSeries({ lineWidth: 1.4, priceLineVisible: false,
-    lastValueVisible: false, crosshairMarkerVisible: false }));
+  // One series per selectable daily average (21/50/150/200); the weekly and monthly sets
+  // are shorter, so the spare series simply carry no data.
+  const maSeries = MSChart.MA_PERIODS.D.map(() => chart.addLineSeries({ lineWidth: 1.4,
+    priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false }));
   const rsSeries = chart.addLineSeries({ color: "#2ee6a8", lineWidth: 1.2, priceLineVisible: false,
     lastValueVisible: false, crosshairMarkerVisible: false });
   const indexSeries = chart.addLineSeries({ color: "#8a97a8", lineWidth: 1, priceScaleId: "idx",
@@ -857,6 +934,28 @@ async function initChart(config, context, mount = {}) {
   let timeframe = storedTimeframe();
   let indexVisible = false;
   let bars = [];
+  let maStore = loadMaPeriods();
+  let maPeriods = MSChart.maSelection(maStore, timeframe);
+
+  /* The "MAs" control: one checkbox per selectable period for the timeframe on screen,
+     remembered per timeframe in localStorage. */
+  function renderMaControls() {
+    const host = $("ma-tools");
+    if (!host) return;
+    const unit = timeframe === "W" ? "w" : timeframe === "M" ? "m" : "d";
+    host.innerHTML = '<span class="ma-label">MAs</span>' + (MSChart.MA_PERIODS[timeframe] || [])
+      .map((period) => `<label class="ma-toggle"><input type="checkbox" data-ma="${period}"`
+        + `${maPeriods.includes(period) ? " checked" : ""}> ${period}${unit}</label>`).join("");
+    document.querySelectorAll("#ma-tools [data-ma]").forEach((input) =>
+      input.addEventListener("change", () => {
+        const chosen = [...document.querySelectorAll("#ma-tools [data-ma]")]
+          .filter((entry) => entry.checked).map((entry) => Number(entry.dataset.ma));
+        maStore = MSChart.maStore(maStore, timeframe, chosen);
+        maPeriods = MSChart.maSelection(maStore, timeframe);
+        saveMaPeriods(maStore);
+        render();
+      }));
+  }
 
   function render() {
     bars = timeframe === "D" ? daily : timeframe === "W"
@@ -868,16 +967,19 @@ async function initChart(config, context, mount = {}) {
     volumeAverage.setData(volumes.filter((entry) => entry.average !== null)
       .map((entry) => ({ time: entry.time, value: entry.average })));
     const closes = bars.map((bar) => bar[4]);
-    const periods = MSChart.MA_PERIODS[timeframe];
-    const colors = ["#4da3ff", "#f5a623", "#d678ff"];
+    // Display only: the reader's moving-average choice changes what is drawn and nothing
+    // else — no score, gate or signal reads it (SPEC-AH §5).
+    const periods = maPeriods;
     maSeries.forEach((series, index) => {
       const period = periods[index];
       if (!period) { series.setData([]); return; }
       const values = MSChart.movingAverage(closes, period);
-      series.applyOptions({ color: colors[index] });
+      series.applyOptions({ color: MSChart.maColor(period, timeframe) });
       series.setData(bars.map((bar, position) => values[position] === null
         ? null : { time: bar[0], value: values[position] }).filter(Boolean));
     });
+    const legend = $("chart-ma-legend");
+    if (legend) legend.textContent = MSChart.maLegend(periods, timeframe);
     const rs = MSChart.rsLine(bars, rsCloses);
     rsSeries.setData(rs.points.map((point) => ({ time: point.time, value: point.value })));
     const rating = (config.ratings_compact || {}).rs;
@@ -941,6 +1043,7 @@ async function initChart(config, context, mount = {}) {
   let tool = "select";
   let pending = null;
   let selected = null;
+  let drag = null;
 
   function svg(name, attributes) {
     const node = document.createElementNS("http://www.w3.org/2000/svg", name);
@@ -957,19 +1060,28 @@ async function initChart(config, context, mount = {}) {
     overlay.setAttribute("width", width);
     overlay.setAttribute("height", height);
     for (const drawing of drawings.concat(pending ? [pending] : [])) {
-      const projected = MSChart.project(drawing, adapter);
+      // Dated points are binned onto the bars actually on screen (SPEC-AH §4), so a
+      // drawing made on the daily chart still lands on the right weekly candle.
+      const projected = MSChart.project(drawing, adapter, { bars, timeframe });
       if (!projected) continue;
       const stroke = drawing.color;
       const active = selected && selected.id === drawing.id;
       const common = { stroke, "stroke-width": active ? 2.4 : 1.4, fill: "none",
         "data-drawing": drawing.id };
+      // Each stroke gets an invisible, wider "hit" twin: in select mode the overlay itself
+      // ignores the pointer (the chart keeps its pan and zoom), so only the twins can
+      // deliver a mousedown to the select/drag handler below.
+      const hit = { class: "hit", "data-drawing": drawing.id };
       if (drawing.tool === "hline") {
         overlay.appendChild(svg("line", { x1: 0, x2: width, y1: projected.y, y2: projected.y, ...common }));
+        overlay.appendChild(svg("line", { x1: 0, x2: width, y1: projected.y, y2: projected.y, ...hit }));
       } else if (drawing.tool === "rect") {
         const [a, b] = projected.points;
         overlay.appendChild(svg("rect", { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y),
           width: Math.abs(b.x - a.x), height: Math.abs(b.y - a.y), ...common,
           fill: `${stroke}22` }));
+        overlay.appendChild(svg("rect", { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y),
+          width: Math.abs(b.x - a.x), height: Math.abs(b.y - a.y), ...hit }));
       } else if (drawing.tool === "text") {
         const [anchor] = projected.points;
         const label = svg("text", { x: anchor.x, y: anchor.y, fill: stroke, "data-drawing": drawing.id,
@@ -978,9 +1090,10 @@ async function initChart(config, context, mount = {}) {
         overlay.appendChild(label);
       } else {
         const [a, b] = projected.points;
-        const extended = drawing.tool === "ray"
-          ? { x: a.x + (b.x - a.x) * 40, y: a.y + (b.y - a.y) * 40 } : b;
+        // One extension factor for the renderer and the hit test: MSChart.raySegment.
+        const extended = drawing.tool === "ray" ? MSChart.raySegment(a, b)[1] : b;
         overlay.appendChild(svg("line", { x1: a.x, y1: a.y, x2: extended.x, y2: extended.y, ...common }));
+        overlay.appendChild(svg("line", { x1: a.x, y1: a.y, x2: extended.x, y2: extended.y, ...hit }));
       }
     }
   }
@@ -1003,16 +1116,27 @@ async function initChart(config, context, mount = {}) {
   overlay?.addEventListener("mousedown", (event) => {
     const point = pointFromEvent(event);
     if (tool === "select") {
-      selected = MSChart.hitTest(drawings, point, adapter);
+      selected = MSChart.hitTest(drawings, point, adapter, { bars, timeframe });
+      // A mousedown on a hit drawing starts a move; the original is kept so Escape can
+      // put it back exactly where it was (SPEC-AH §4).
+      drag = selected ? { id: selected.id, origin: point,
+        original: JSON.parse(JSON.stringify(selected)) } : null;
+      // While a drag is live the overlay takes the pointer, so the move keeps tracking
+      // after the cursor leaves the thin stroke it started on.
+      overlay.classList.toggle("dragging", Boolean(drag));
+      if (drag) event.preventDefault();
       renderDrawings();
       return;
     }
-    if (!point.time || !Number.isFinite(point.price)) return;
+    if (!Number.isFinite(point.price)) return;
+    // A horizontal line needs a price and nothing else, so it can be dropped anywhere on
+    // the pane — including right of the last bar, where there is no date to read.
     if (tool === "hline") {
-      drawings.push(MSChart.createDrawing("hline", [{ time: point.time, price: point.price }]));
+      drawings.push(MSChart.createDrawing("hline", [{ price: point.price }]));
       persist();
       return;
     }
+    if (!point.time) return;
     if (tool === "text") {
       const text = window.prompt("Note text");
       if (text) {
@@ -1025,13 +1149,30 @@ async function initChart(config, context, mount = {}) {
       { time: point.time, price: point.price }]);
   });
   overlay?.addEventListener("mousemove", (event) => {
+    if (drag) {
+      const point = pointFromEvent(event);
+      const stamps = bars.map((bar) => String(bar[0]));
+      const from = MSChart.readTime(drag.origin.time);
+      const to = MSChart.readTime(point.time);
+      const barDelta = from && to ? stamps.indexOf(to) - stamps.indexOf(from) : 0;
+      const priceDelta = Number.isFinite(point.price) && Number.isFinite(drag.origin.price)
+        ? point.price - drag.origin.price : 0;
+      const index = drawings.findIndex((entry) => entry.id === drag.id);
+      if (index !== -1) {
+        drawings[index] = MSChart.moveDrawing(drag.original, barDelta, priceDelta, stamps);
+        selected = drawings[index];
+        renderDrawings();
+      }
+      return;
+    }
     if (!pending) return;
     const point = pointFromEvent(event);
     if (!point.time || !Number.isFinite(point.price)) return;
-    pending.points[1] = { time: point.time, price: point.price };
+    pending.points[1] = { time: MSChart.readTime(point.time) || point.time, price: point.price };
     renderDrawings();
   });
   overlay?.addEventListener("mouseup", () => {
+    if (drag) { drag = null; overlay.classList.remove("dragging"); persist(); return; }
     if (!pending) return;
     drawings.push(pending);
     pending = null;
@@ -1061,6 +1202,8 @@ async function initChart(config, context, mount = {}) {
     try { localStorage.setItem(TIMEFRAME_KEY, timeframe); } catch { /* private mode */ }
     document.querySelectorAll("[data-timeframe]").forEach((other) =>
       other.setAttribute("aria-pressed", String(other.dataset.timeframe === timeframe)));
+    maPeriods = MSChart.maSelection(maStore, timeframe);
+    renderMaControls();
     render();
   }));
   $("toggle-index")?.addEventListener("click", () => {
@@ -1088,7 +1231,16 @@ async function initChart(config, context, mount = {}) {
     }
     if (action === "panel") { setPanel(document.querySelector(".chart-layout")?.classList.contains("panel-hidden")); return; }
     if (action === "list") { toggleListDrawer(context); return; }
-    if (action === "cancel") { pending = null; selected = null; tool = "select"; renderDrawings(); return; }
+    if (action === "cancel") {
+      // Escape during a drag restores the drawing exactly as it was before the move.
+      if (drag) {
+        const index = drawings.findIndex((entry) => entry.id === drag.id);
+        if (index !== -1) drawings[index] = drag.original;
+        drag = null;
+        overlay?.classList.remove("dragging");
+      }
+      pending = null; selected = null; tool = "select"; renderDrawings(); return;
+    }
     if (action === "delete" && selected) {
       drawings = drawings.filter((entry) => entry.id !== selected.id);
       selected = null;
@@ -1103,6 +1255,7 @@ async function initChart(config, context, mount = {}) {
   new ResizeObserver(() => { positionBand(); renderDrawings(); }).observe(host);
   document.querySelectorAll("[data-timeframe]").forEach((other) =>
     other.setAttribute("aria-pressed", String(other.dataset.timeframe === timeframe)));
+  renderMaControls();
   render();
   requestAnimationFrame(() => requestAnimationFrame(() => { positionBand(); renderDrawings(); }));
 }
@@ -1775,10 +1928,20 @@ function initDeals() {
 
 /* ── §7 polish: theme, keyboard help, mobile drawer ───────────────────────── */
 const THEME_KEY = "sepa_theme";
+/* Anything that paints its own colours (the chart) registers here and repaints when the
+   reader switches themes; a dark grid on a light ground is a rendering bug, not a style. */
+const themeListeners = [];
+
+function onThemeChange(listener) {
+  if (typeof listener === "function") themeListeners.push(listener);
+}
 
 function applyTheme(theme) {
   const root = document.documentElement;
   if (root.dataset) root.dataset.theme = theme;
+  for (const listener of themeListeners) {
+    try { listener(theme); } catch { /* a repaint must never break the toggle */ }
+  }
   const button = $("theme-toggle");
   if (button) {
     button.setAttribute("aria-pressed", String(theme === "light"));

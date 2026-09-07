@@ -18,6 +18,10 @@ const Lists = (() => {
   const TEXT_COLUMNS = new Set(["symbol", "name", "group", "base_status", "stage", "entry_state",
     "ad_rating", "included_in", "surveillance", "last_date"]);
   const ASCENDING_DEFAULT = new Set(["symbol", "name", "group", "group_rank", "pct_to_pivot"]);
+  /* B1: a composite built from four of the five components is not the same figure as one
+     built from all five, so the cell carries its basis wherever it is rendered. */
+  const COMPOSITE_PARTIAL_MARK = "P";
+  const COMPOSITE_PARTIAL_TITLE = "partial input set";
 
   const finite = (value) => typeof value === "number" && Number.isFinite(value);
 
@@ -33,6 +37,7 @@ const Lists = (() => {
       case "close": return row.close;
       case "chg_pct": return row.chg_pct;
       case "composite": return ratings.composite;
+      case "composite_basis": return ratings.composite_basis || null;
       case "eps_rating": return ratings.eps;
       case "rs_rating": return ratings.rs;
       case "ad_rating": return ratings.ad;
@@ -67,6 +72,12 @@ const Lists = (() => {
   function formatCell(row, key, extras = {}) {
     const value = cellValue(row, key, extras);
     if (value === null || value === undefined || value === "") return "–";
+    // One source of truth for the composite cell: the Python list renderer mirrors this
+    // exact string, so a browser table and a generated table cannot disagree.
+    if (key === "composite" && finite(Number(value))) {
+      return `${Math.round(Number(value))}`
+        + (compositeBasis(row) === "partial" ? ` ${COMPOSITE_PARTIAL_MARK}` : "");
+    }
     if (TEXT_COLUMNS.has(key)) return String(value);
     if (!finite(Number(value))) return String(value);
     const number = Number(value);
@@ -76,6 +87,24 @@ const Lists = (() => {
     if (PRICE_COLUMNS.has(key)) return `₹${number.toFixed(2)}`;
     if (INTEGER_COLUMNS.has(key)) return String(Math.round(number));
     return `${sign}${number.toFixed(2)}`;
+  }
+
+  function compositeBasis(row) {
+    return ((row && row.ratings) || {}).composite_basis || null;
+  }
+
+  /* The composite cell as text plus what a renderer needs to mark it up. */
+  function compositeCell(row) {
+    const basis = compositeBasis(row);
+    return {
+      text: formatCell(row, "composite"),
+      basis,
+      partial: basis === "partial",
+      mark: basis === "partial" ? COMPOSITE_PARTIAL_MARK : "",
+      title: basis === "partial" ? COMPOSITE_PARTIAL_TITLE : null,
+      missing: ((row && row.ratings) || {}).composite_missing || [],
+      label: basis === "partial" ? "Composite (P)" : "Composite",
+    };
   }
 
   function compare(a, b, direction) {
@@ -128,7 +157,8 @@ const Lists = (() => {
       change: formatCell(row, "chg_pct"),
       changeClass: finite(row.chg_pct) ? (row.chg_pct > 0 ? "positive" : row.chg_pct < 0 ? "negative" : "muted") : "muted",
       ratings: [
-        { label: "Composite", value: formatCell(row, "composite") },
+        { label: compositeCell(row).label, value: formatCell(row, "composite"),
+          title: compositeCell(row).title },
         { label: "RS", value: formatCell(row, "rs_rating") },
         { label: "EPS", value: formatCell(row, "eps_rating") },
         { label: "A/D", value: formatCell(row, "ad_rating") },
@@ -148,8 +178,19 @@ const Lists = (() => {
     return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
   }
 
+  /* The export always carries the composite's basis in its own column, right after the
+     value it qualifies. */
+  function csvColumns(columns) {
+    const out = [];
+    for (const key of columns || []) {
+      out.push(key);
+      if (key === "composite" && !(columns || []).includes("composite_basis")) out.push("composite_basis");
+    }
+    return out;
+  }
+
   function csv(payload, rows) {
-    const columns = payload.columns || [];
+    const columns = csvColumns(payload.columns || []);
     const labels = payload.column_labels || {};
     const included = payload.included_in || {};
     const header = [`# ${payload.title}`, `# ${payload.description}`,
@@ -211,7 +252,8 @@ const Lists = (() => {
 
   return {
     contractVersion: LISTS_CONTRACT_VERSION, PAGE_SIZE, cellValue, formatCell, compare, sortRows,
-    defaultDirection, sortOptions, sparkPath, cardModel, csvCell, csv, page,
+    defaultDirection, sortOptions, sparkPath, cardModel, csvCell, csv, csvColumns, page,
+    COMPOSITE_PARTIAL_MARK, COMPOSITE_PARTIAL_TITLE, compositeBasis, compositeCell,
     pageOf, stockHref, listLink,
   };
 })();

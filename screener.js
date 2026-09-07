@@ -226,3 +226,6 @@ const Screener = (() => {
     contractVersion: SCREENER_CONTRACT_VERSION, defaults, normalize, preset, activePreset, forSnapshot, availability, financialOn, financialVerdict, financialEvaluated, usableFund, coverage,
     financialCoverage, coverageText, matches, distance, distanceText, displayedPivot, monthDelta, eventText, legMarkers, description, csvCell, csv };
 })();
+/* Loadable in Node exactly like the other shared modules, so the grouped-filter layer can
+   call the core freshness rule instead of re-implementing it. No filter semantics change. */
+if (typeof module !== "undefined" && module.exports) module.exports = Screener;

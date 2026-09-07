@@ -11,9 +11,16 @@ const MSChart = (() => {
   const MSCHART_CONTRACT_VERSION = "mschart-1.0";
   const DRAW_TOOLS = ["trend", "hline", "ray", "rect", "text"];
   const TIMEFRAMES = ["D", "W", "M"];
-  const MA_PERIODS = { D: [21, 50, 200], W: [10, 40], M: [10] };
+  /* Every moving average the reader may switch on, per timeframe. The daily set carries
+     the 150-day line the SEPA Trend Template reads; the weekly 10/40 pair is the familiar
+     view. Display only: no signal, score or gate reads this selection. */
+  const MA_PERIODS = { D: [21, 50, 150, 200], W: [10, 40], M: [10] };
+  const MA_DEFAULTS = { D: [50, 150, 200], W: [10, 40], M: [10] };
+  const MA_STORAGE_KEY = "sepa_ma_periods";
+  const MA_COLORS = ["#4da3ff", "#f5a623", "#d678ff", "#2ee6a8"];
   const RS_LOOKBACK = { D: 252, W: 52, M: 12 };
   const HIT_TOLERANCE = 6;
+  const RAY_EXTENSION = 40;   // the renderer and the hit test must agree on one factor
   const finite = (value) => typeof value === "number" && Number.isFinite(value);
   const numeric = (value) => (finite(Number(value)) ? Number(value) : null);
 
@@ -56,6 +63,35 @@ const MSChart = (() => {
       }
     }
     return out;
+  }
+
+  /* The stored selection for one timeframe: known periods only, ascending; an absent or
+     unreadable entry falls back to the documented default set. */
+  function maSelection(stored, timeframe) {
+    const periods = MA_PERIODS[timeframe] || [];
+    const source = stored && typeof stored === "object" ? stored[timeframe] : undefined;
+    if (!Array.isArray(source)) return (MA_DEFAULTS[timeframe] || []).slice();
+    const chosen = [...new Set(source.map(Number).filter((value) => periods.includes(value)))];
+    return chosen.sort((left, right) => left - right);
+  }
+
+  function maStore(stored, timeframe, periods) {
+    const next = stored && typeof stored === "object" ? { ...stored } : {};
+    next[timeframe] = maSelection({ [timeframe]: periods }, timeframe);
+    return next;
+  }
+
+  function maColor(period, timeframe) {
+    const index = (MA_PERIODS[timeframe] || []).indexOf(Number(period));
+    return MA_COLORS[index === -1 ? 0 : index % MA_COLORS.length];
+  }
+
+  /* The legend text for the periods actually drawn, in the reader's own units. */
+  function maLegend(periods, timeframe) {
+    const unit = timeframe === "W" ? "w" : timeframe === "M" ? "m" : "d";
+    const chosen = (periods || []).slice().sort((left, right) => left - right);
+    return chosen.length ? `${chosen.map((period) => `${period}${unit}`).join(" / ")} MA`
+      : "no moving average shown";
   }
 
   function movingAverage(values, period) {
@@ -162,9 +198,12 @@ const MSChart = (() => {
       note: `${events.length} full-window highs over ${count} aligned ${benchmark} sessions` };
   }
 
-  /* lightweight-charts accepts three time types. Normalise them all to "YYYY-MM-DD"
-     rather than stringifying an object into "[object Object]". */
-  function normalizeTime(time) {
+  /* lightweight-charts accepts three time types: ISO strings, {year, month, day}
+     BusinessDay objects and epoch seconds/milliseconds. ``readTime`` reads all three and
+     answers null for anything else; ``normalizeTime`` is the strict form callers use when
+     an unreadable date is a bug rather than a missing marker. Neither ever stringifies an
+     object into "[object Object]". */
+  function readTime(time) {
     if (time === null || time === undefined) return null;
     if (typeof time === "number" && Number.isFinite(time)) {
       const stamp = new Date(Math.abs(time) < 1e11 ? time * 1000 : time);
@@ -181,6 +220,15 @@ const MSChart = (() => {
     return /^\d{4}-\d{2}-\d{2}$/.test(day) ? day : null;
   }
 
+  function normalizeTime(time) {
+    const day = readTime(time);
+    if (day === null) {
+      throw new Error(`unsupported chart time value: ${typeof time === "object"
+        ? JSON.stringify(time) : String(time)}`);
+    }
+    return day;
+  }
+
   /* Map RS events onto the bars actually displayed. Documented semantics: a weekly or
      monthly RS marker means at least one session in that period closed the RS line at a
      252-session high; `count` says how many. */
@@ -193,7 +241,7 @@ const MSChart = (() => {
     for (const bar of rows) periods.set(keyOf(String(bar[0])), String(bar[0]));
     const counts = new Map();
     for (const event of list) {
-      const date = normalizeTime(event && event.date);
+      const date = readTime(event && event.date);
       if (!date) continue;
       const time = periods.get(keyOf(date));
       if (!time) continue;
@@ -219,7 +267,7 @@ const MSChart = (() => {
     const flat = [];
     for (const group of groups) {
       for (const marker of group || []) {
-        const time = normalizeTime(marker && marker.time);
+        const time = readTime(marker && marker.time);
         if (!time) throw new Error(`marker without a valid date: ${JSON.stringify(marker) || marker}`);
         flat.push({ ...marker, time });
       }
@@ -236,7 +284,7 @@ const MSChart = (() => {
   function assertSortedMarkers(markers) {
     let previous = null;
     for (const marker of markers || []) {
-      const time = normalizeTime(marker && marker.time);
+      const time = readTime(marker && marker.time);
       if (!time) throw new Error("marker without a valid date");
       if (previous !== null && time < previous) {
         throw new Error(`marker times are not ascending: ${time} follows ${previous}`);
@@ -336,14 +384,46 @@ const MSChart = (() => {
   function createDrawing(tool, points, options = {}) {
     if (!DRAW_TOOLS.includes(tool)) throw new Error(`unknown drawing tool: ${tool}`);
     sequence += 1;
+    const stored = (points || []).map((point) => {
+      const price = Number(point && point.price);
+      if (!Number.isFinite(price)) throw new Error("a drawing point needs a finite price");
+      // A horizontal line is a price and nothing else: it must survive a timeframe switch
+      // even when its original anchor date is not a bar in the new view. Anything dated is
+      // normalised to YYYY-MM-DD here, so no stored point can hold an unreadable time.
+      return tool === "hline" ? { price } : { time: normalizeTime(point.time), price };
+    });
     return {
       id: options.id || `d${Date.now().toString(36)}${sequence.toString(36)}`,
       tool,
       color: options.color || "#4da3ff",
       text: options.text || "",
-      points: (points || []).map((point) => ({ time: String(point.time), price: Number(point.price) })),
+      points: stored,
       created: options.created || null,
     };
+  }
+
+  /* The displayed bar whose period contains ``time``: on D the last bar on or before the
+     date, on W the bar stamped with that ISO week, on M the bar stamped with that month.
+     ``null`` when the date precedes the first displayed bar — the drawing is then off
+     screen rather than clamped onto the first candle. The drawing keeps its own date. */
+  function binTime(time, bars, timeframe) {
+    const day = readTime(time);
+    const rows = Array.isArray(bars) ? bars : [];
+    if (day === null || !rows.length) return null;
+    const stamps = rows.map((bar) => String(Array.isArray(bar) ? bar[0] : bar));
+    const keyOf = timeframe === "W" ? isoWeekKey : timeframe === "M" ? monthKey : null;
+    if (keyOf) {
+      const key = keyOf(day);
+      const match = stamps.find((stamp) => keyOf(stamp) === key);
+      if (match) return match;
+    }
+    if (day < stamps[0]) return null;
+    let found = null;
+    for (const stamp of stamps) {
+      if (stamp <= day) found = stamp;
+      else break;
+    }
+    return found;
   }
 
   function snapToClose(price, bars, time) {
@@ -351,17 +431,34 @@ const MSChart = (() => {
     return bar ? Number(bar[4]) : price;
   }
 
-  function project(drawing, adapter) {
+  /* ``options.bars`` and ``options.timeframe`` bin every dated point onto the bar that is
+     actually on screen, so a Monday-anchored trend line still lands on the Friday-stamped
+     weekly candle. Without them the stored time is used as-is. */
+  function project(drawing, adapter, options = {}) {
+    const bars = options.bars || null;
+    const timeframe = options.timeframe || "D";
+    if (drawing.tool === "hline") {
+      const price = Number((drawing.points[0] || {}).price);
+      const y = Number.isFinite(price) ? adapter.priceToCoordinate(price) : null;
+      if (y === null || y === undefined) return null;
+      // Price only: no date is consulted, so the line is drawn on every timeframe.
+      return { tool: "hline", y, points: [{ x: null, y }] };
+    }
     const points = drawing.points.map((point) => {
-      const x = adapter.timeToCoordinate(point.time);
+      const time = bars ? binTime(point.time, bars, timeframe) : point.time;
+      if (time === null || time === undefined) return null;
+      const x = adapter.timeToCoordinate(time);
       const y = adapter.priceToCoordinate(point.price);
       return x === null || y === null || x === undefined || y === undefined ? null : { x, y };
     });
     if (points.some((point) => point === null)) return null;
-    if (drawing.tool === "hline" && points.length === 1) {
-      return { tool: "hline", y: points[0].y, points };
-    }
     return { tool: drawing.tool, points };
+  }
+
+  /* A ray is drawn from its anchor through the second point and far beyond it; the hit
+     test must use the same segment the renderer draws, not just the first leg. */
+  function raySegment(a, b) {
+    return [a, { x: a.x + (b.x - a.x) * RAY_EXTENSION, y: a.y + (b.y - a.y) * RAY_EXTENSION }];
   }
 
   function distanceToSegment(point, a, b) {
@@ -374,10 +471,12 @@ const MSChart = (() => {
     return Math.hypot(point.x - (a.x + t * dx), point.y - (a.y + t * dy));
   }
 
-  function hitTest(drawings, point, adapter, tolerance = HIT_TOLERANCE) {
+  function hitTest(drawings, point, adapter, options = {}) {
+    const settings = typeof options === "number" ? { tolerance: options } : (options || {});
+    const tolerance = Number.isFinite(settings.tolerance) ? settings.tolerance : HIT_TOLERANCE;
     for (let index = (drawings || []).length - 1; index >= 0; index -= 1) {
       const drawing = drawings[index];
-      const projected = project(drawing, adapter);
+      const projected = project(drawing, adapter, settings);
       if (!projected) continue;
       if (drawing.tool === "hline") {
         if (Math.abs(point.y - projected.y) <= tolerance) return drawing;
@@ -396,21 +495,35 @@ const MSChart = (() => {
         continue;
       }
       const [a, b] = projected.points;
-      if (a && b && distanceToSegment(point, a, b) <= tolerance) return drawing;
+      if (!a || !b) continue;
+      const [from, to] = drawing.tool === "ray" ? raySegment(a, b) : [a, b];
+      if (distanceToSegment(point, from, to) <= tolerance) return drawing;
     }
     return null;
   }
 
+  /* Move a drawing by whole bars and a price delta. A price-only point (a horizontal
+     line) keeps its shape: only its price moves. */
   function moveDrawing(drawing, deltaTimeIndex, deltaPrice, times) {
+    const stamps = (times || []).map(String);
+    const bars = Number(deltaTimeIndex) || 0;
+    const price = Number(deltaPrice) || 0;
     const shifted = drawing.points.map((point) => {
-      const index = times.indexOf(String(point.time));
-      const target = index === -1 ? index : Math.max(0, Math.min(times.length - 1, index + deltaTimeIndex));
-      return {
-        time: target === -1 ? point.time : times[target],
-        price: point.price + deltaPrice,
-      };
+      if (point.time === null || point.time === undefined) return { price: point.price + price };
+      const index = stamps.indexOf(String(point.time));
+      const target = index === -1 ? -1 : Math.max(0, Math.min(stamps.length - 1, index + bars));
+      return { time: target === -1 ? point.time : stamps[target], price: point.price + price };
     });
     return { ...drawing, points: shifted };
+  }
+
+  /* One unreadable stored drawing must not take the reader's other drawings with it. */
+  function safeDrawing(tool, points, options) {
+    try {
+      return createDrawing(tool, points, options);
+    } catch {
+      return null;
+    }
   }
 
   const storageKey = (symbol) => `sepa_drawings:${String(symbol || "").toUpperCase()}`;
@@ -421,7 +534,8 @@ const MSChart = (() => {
       const parsed = raw ? JSON.parse(raw) : null;
       const list = Array.isArray(parsed) ? parsed : parsed && Array.isArray(parsed.drawings) ? parsed.drawings : [];
       return list.filter((entry) => entry && DRAW_TOOLS.includes(entry.tool) && Array.isArray(entry.points))
-        .map((entry) => createDrawing(entry.tool, entry.points, entry));
+        .map((entry) => safeDrawing(entry.tool, entry.points, entry))
+        .filter((entry) => entry !== null);
     } catch {
       return [];
     }
@@ -442,7 +556,8 @@ const MSChart = (() => {
     const parsed = JSON.parse(text);
     const list = Array.isArray(parsed) ? parsed : parsed.drawings || [];
     return list.filter((entry) => entry && DRAW_TOOLS.includes(entry.tool))
-      .map((entry) => createDrawing(entry.tool, entry.points || [], entry));
+      .map((entry) => safeDrawing(entry.tool, entry.points || [], entry))
+      .filter((entry) => entry !== null);
   }
 
   /* ── list context and keyboard ──────────────────────────────────────────
@@ -538,6 +653,15 @@ const MSChart = (() => {
     };
   }
 
+  /* ``99 · partial (no EPS)`` — the composite never appears without its input set. */
+  function compositeDisplay(composite) {
+    const entry = composite || {};
+    if (entry.value === null || entry.value === undefined) return null;
+    const missing = (entry.missing || []).map((name) => String(name).toUpperCase());
+    return `${entry.value} · ${entry.basis || "unknown basis"}`
+      + (missing.length ? ` (no ${missing.join(", ")})` : "");
+  }
+
   function panelModel(payload) {
     const ratings = (payload && payload.ratings) || {};
     const facts = (payload && payload.facts) || {};
@@ -549,7 +673,10 @@ const MSChart = (() => {
     return {
       annual: (payload && payload.annual) || [],
       ratings: [
-        panelValue("Composite Score", rating("composite").value, rating("composite").coverage_note),
+        panelValue("Composite (custom)", compositeDisplay(rating("composite")),
+          rating("composite").coverage_note),
+        panelValue("Composite (full-evidence)", rating("composite_full").value,
+          rating("composite_full").coverage_note),
         panelValue("EPS Rating", rating("eps_rating").value, rating("eps_rating").coverage_note),
         panelValue("Price Strength", rating("rs_rating").value, rating("rs_rating").coverage_note),
         panelValue("Acc/Dis Rating", rating("ad_rating").value, rating("ad_rating").coverage_note),
@@ -566,9 +693,12 @@ const MSChart = (() => {
       ],
       ratios: [
         panelValue("Yield", facts.dividend_yield_pct, notes.dividend_yield_pct, "%"),
-        panelValue("Book Value", facts.book_value_multiple, notes.book_value_multiple, "×"),
+        panelValue("Price/Book", facts.book_value_multiple, notes.book_value_multiple, "×"),
+        panelValue("Book value/share (₹, derived)", facts.book_value_per_share,
+          notes.book_value_per_share),
         panelValue("U/D Vol Ratio", facts.ud_vol_ratio, notes.ud_vol_ratio),
-        panelValue("LT Debt/Equity", facts.ltdebt_equity_pct, notes.ltdebt_equity_pct, "%"),
+        panelValue("Debt/Equity (total borrowings)", facts.ltdebt_equity_pct,
+          notes.ltdebt_equity_pct, "%"),
         panelValue("Alpha", facts.alpha, notes.alpha, "%"),
         panelValue("Beta", facts.beta, notes.beta),
       ],
@@ -586,12 +716,15 @@ const MSChart = (() => {
 
   return {
     contractVersion: MSCHART_CONTRACT_VERSION, DRAW_TOOLS, TIMEFRAMES, MA_PERIODS, RS_LOOKBACK,
+    MA_DEFAULTS, MA_STORAGE_KEY, MA_COLORS, maSelection, maStore, maColor, maLegend,
     isoWeekKey, monthKey, aggregate, movingAverage, rsLine, volumeSeries,
     loadedRange, referenceModel, partialLast, partialLastNote,
-    fnv1a12, rsEvents, normalizeTime, eventMarkers, sortedMarkers, assertSortedMarkers,
+    fnv1a12, rsEvents, readTime, normalizeTime, eventMarkers, sortedMarkers, assertSortedMarkers,
     createDrawing, snapToClose, project, hitTest, moveDrawing, distanceToSegment,
+    binTime, raySegment, RAY_EXTENSION, HIT_TOLERANCE,
     storageKey, loadDrawings, saveDrawings, exportDrawings, importDrawings,
     LIST_CONTEXT_VERSION, listSort, listContext, advance, keyAction, panelModel, panelValue,
+    compositeDisplay,
   };
 })();
 if (typeof module !== "undefined" && module.exports) module.exports = MSChart;
