@@ -1,3 +1,8 @@
+/* The hidden attribute has to beat the display rules below: a class selector outranks
+   the UA sheet's [hidden]{display:none}, so hidden alone silently failed and the
+   owner-only refresh link shipped visible to every visitor. */
+[hidden] { display: none !important; }
+
 :root {
   --bg: #0b0f14;
   --panel: #11161d;
