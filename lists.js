@@ -119,11 +119,11 @@ const Lists = (() => {
       `${(index * step).toFixed(1)},${(height - ((value - min) / span) * height).toFixed(1)}`).join(" ");
   }
 
-  function cardModel(row, spark, extras = {}) {
+  function cardModel(row, spark, extras = {}, basePath = "", pages) {
     return {
       symbol: row.symbol,
       name: row.name,
-      href: row.has_page ? `/s/${row.symbol}.html` : "/#screener",
+      href: stockHref(row.symbol, basePath, pages || { [row.symbol]: pageOf(row.symbol, row) }),
       close: formatCell(row, "close"),
       change: formatCell(row, "chg_pct"),
       changeClass: finite(row.chg_pct) ? (row.chg_pct > 0 ? "positive" : row.chg_pct < 0 ? "negative" : "muted") : "muted",
@@ -168,15 +168,51 @@ const Lists = (() => {
     return { rows: (rows || []).slice(0, limit), more: (rows || []).length > limit, shown: Math.min(limit, (rows || []).length) };
   }
 
-  function listLink(listId, symbols, symbol, basePath = "") {
+  /* ── routes ──────────────────────────────────────────────────────────────
+     One resolver for every destination the browser builds. ``pages`` may be a map of
+     symbol → "full"|"technical", a Set of the symbols with full pages, or a row that
+     carries its own ``page``/``has_page``. A symbol nobody knows about still resolves:
+     the generic technical route reports honestly that it is not in this snapshot. */
+  function pageOf(symbol, pages) {
+    const key = String(symbol === null || symbol === undefined ? "" : symbol);
+    if (!pages) return null;
+    if (typeof pages.has === "function" && typeof pages.get !== "function") {
+      return pages.has(key) ? "full" : "technical";
+    }
+    if (typeof pages.get === "function") return pages.get(key) || null;
+    if (typeof pages === "object") {
+      if (pages.page === "full" || pages.page === "technical") return pages.page;
+      if (pages.has_page === true) return "full";
+      if (pages.has_page === false) return "technical";
+      return Object.prototype.hasOwnProperty.call(pages, key) ? pages[key] : null;
+    }
+    return null;
+  }
+
+  function stockHref(symbol, basePath = "", pages) {
+    const key = String(symbol === null || symbol === undefined ? "" : symbol);
+    return pageOf(key, pages) === "full"
+      ? `${basePath}/s/${key}.html`
+      : `${basePath}/s/?symbol=${encodeURIComponent(key)}`;
+  }
+
+  /* A stock URL that carries its list as the keyboard context, including the sort the
+     reader is actually looking at — so Space/→ follows the visible order. */
+  function listLink(listId, symbols, symbol, basePath = "", options = {}) {
     const index = (symbols || []).indexOf(symbol);
-    const query = index === -1 ? "" : `?list=${encodeURIComponent(listId)}&i=${index}`;
-    return `${basePath}/s/${symbol}.html${query}`;
+    const href = stockHref(symbol, basePath, options.pages);
+    if (index === -1) return href;
+    const sort = options.sort && options.sort.key
+      ? `&sort=${encodeURIComponent(`${options.sort.key}:${options.sort.direction === "asc" ? "asc" : "desc"}`)}`
+      : "";
+    const separator = href.includes("?") ? "&" : "?";
+    return `${href}${separator}list=${encodeURIComponent(listId)}${sort}&i=${index}`;
   }
 
   return {
     contractVersion: LISTS_CONTRACT_VERSION, PAGE_SIZE, cellValue, formatCell, compare, sortRows,
-    defaultDirection, sortOptions, sparkPath, cardModel, csvCell, csv, page, listLink,
+    defaultDirection, sortOptions, sparkPath, cardModel, csvCell, csv, page,
+    pageOf, stockHref, listLink,
   };
 })();
 if (typeof module !== "undefined" && module.exports) module.exports = Lists;

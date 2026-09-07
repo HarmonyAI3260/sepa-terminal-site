@@ -61,7 +61,9 @@ const Portfolio = (() => {
   function gainPct(item, row) {
     const cost = number((item || {}).avg_price);
     const close = number((row || {}).close);
-    return cost && close ? ((close - cost) / cost) * 100 : null;
+    // finite(), never truthiness: a close of 0 is a real (catastrophic) observation and
+    // must not be reported as "no gain data".
+    return finite(cost) && cost > 0 && finite(close) ? ((close - cost) / cost) * 100 : null;
   }
 
   /* Every rule is three-valued: true (breached), false (clear) or null (the input is
@@ -258,54 +260,216 @@ const Portfolio = (() => {
       score: Math.round(score * 10) / 10, reason: null };
   }
 
+  /* ── §4 Portfolio Evaluation: coverage first, grade second ─────────────────
+     Policy (SPEC-AG §5), stated here because the page states it too:
+
+       · a position is *valued* only when a row exists, the quantity is a real number
+         greater than zero, the snapshot carries a finite close, and that close is not
+         stale. A stale close is reported as ``stale_priced``, never as valued.
+       · a position is *scorable* only when it is valued and the per-stock score exists.
+       · no scorable position  → status ``insufficient_data``: grade and score are null.
+       · some scorable         → status ``partial``: the whole-portfolio grade is
+         withheld and every unresolved position is named with its reason. The caller may
+         re-run with ``{subset: true}`` for an explicitly labelled subset grade.
+       · every position scorable → status ``ok``.
+       · a component that cannot be computed is absent, and the remaining weights
+         renormalise — but never from fewer than two components: one component is a
+         restatement of itself, not a portfolio grade.
+
+     Unknown is never treated as clear, and a position that cannot be priced makes total
+     exposure unknown instead of smaller. */
+  const MIN_COMPONENTS = 2;
+
+  function quantityReason(value) {
+    if (value === null || value === undefined || value === "") return "no quantity recorded";
+    const parsed = number(value);
+    if (!finite(parsed)) return `quantity ${JSON.stringify(String(value))} is not a number`;
+    if (parsed === 0) return "quantity is zero";
+    return `quantity ${parsed} is not greater than zero`;
+  }
+
+  /* Two lots of one symbol are one position: quantities add, the cost basis is
+     quantity-weighted over the lots that carry both, and the entry date is the earliest. */
+  function mergeHoldings(holdings) {
+    const order = [];
+    const groups = new Map();
+    for (const entry of holdings || []) {
+      const item = entry || {};
+      const symbol = String(item.symbol || "").toUpperCase();
+      if (!groups.has(symbol)) { groups.set(symbol, []); order.push(symbol); }
+      groups.get(symbol).push(item);
+    }
+    return order.map((symbol) => {
+      const lots = groups.get(symbol);
+      const quantities = lots.map((lot) => number(lot.qty));
+      const usable = quantities.filter((value) => finite(value) && value > 0);
+      const qty = usable.length ? usable.reduce((total, value) => total + value, 0)
+        : lots.length === 1 ? lots[0].qty : null;
+      let costValue = 0;
+      let costQty = 0;
+      lots.forEach((lot, position) => {
+        const price = number(lot.avg_price);
+        const quantity = quantities[position];
+        if (finite(price) && price > 0 && finite(quantity) && quantity > 0) {
+          costValue += price * quantity;
+          costQty += quantity;
+        }
+      });
+      const avg_price = costQty > 0 ? costValue / costQty
+        : lots.length === 1 ? lots[0].avg_price : null;
+      const dates = lots
+        .map((lot) => lot.entry_date || (lot.added_at ? String(lot.added_at).slice(0, 10) : null))
+        .filter(Boolean).sort();
+      return { ...lots[0], symbol, qty, avg_price, entry_date: dates[0] || null, lots: lots.length };
+    });
+  }
+
   function evaluate(holdings, rows, options = {}) {
     const byId = rows instanceof Map ? rows : index(rows);
-    const cards = (holdings || []).map((item) => {
+    const items = mergeHoldings(holdings);
+    const submitted = items.length;
+    const unresolved = [];
+    const cards = items.map((item) => {
       const row = byId.get(String(item.symbol)) || null;
+      const matched = Boolean(row);
+      const quantity = number(item.qty);
+      const validQuantity = finite(quantity) && quantity > 0;
+      const close = number((row || {}).close);
+      const priced = matched && finite(close);
+      const stale = matched && (row || {}).stale === true;
+      const valued = matched && validQuantity && priced && !stale;
+      const stalePriced = matched && validQuantity && priced && stale;
       const card = holdingCard(item, row);
       const scored = stockScore(item, row);
-      return { ...card, score: scored.score, grade: scored.grade,
+      const rulesKnown = card.sell.rules.some((rule) => rule.state === true || rule.state === false);
+      const scorable = valued && finite(scored.score);
+      const reason = !matched ? "no row for this symbol in this snapshot"
+        : !validQuantity ? quantityReason(item.qty)
+        : !priced ? "this snapshot carries no close for the symbol"
+        : stale ? `the close is stale (last data ${(row || {}).last_date || "unknown"})`
+        : !finite(scored.score) ? (scored.reason || "no rated input to score this row")
+        : null;
+      if (reason) unresolved.push({ symbol: item.symbol, reason });
+      return {
+        ...card,
+        lots: item.lots || 1,
+        // Only a valued position carries weight: an unpriced one makes exposure unknown,
+        // it does not make the portfolio look smaller.
+        value: valued ? quantity * close : null,
+        observed_value: card.value,
+        score: scored.score, grade: scored.grade,
         score_components: scored.components, score_reason: scored.reason,
         lifecycle_state: baseOf(row).lifecycle_state || qualificationOf(row).lifecycle_state || null,
         entry_state: qualificationOf(row).entry_state || null,
-        action: action(card, scored) };
+        coverage: { matched, valid_quantity: validQuantity, priced, valued,
+          stale_priced: stalePriced, scorable, rules_known: rulesKnown },
+        unresolved_reason: reason,
+        action: action(card, scored),
+      };
     });
+
+    const valuedCards = cards.filter((card) => card.coverage.valued);
+    const scorableCards = cards.filter((card) => card.coverage.scorable);
+    const valuedTotal = valuedCards.reduce((total, card) => total + card.value, 0);
+    const scorableValue = scorableCards.reduce((total, card) => total + card.value, 0);
     const spread = concentration(cards);
-    const weighted = cards.filter((card) => finite(card.score) && finite(card.value) && card.value > 0);
-    const valueTotal = weighted.reduce((sum, card) => sum + card.value, 0);
-    const holdingsScore = valueTotal
-      ? weighted.reduce((sum, card) => sum + card.score * (card.value / valueTotal), 0)
-      : (cards.filter((card) => finite(card.score)).reduce((sum, card) => sum + card.score, 0)
-        / (cards.filter((card) => finite(card.score)).length || 1)) || null;
-    const breachedValue = cards
-      .filter((card) => card.sell.triggered.length && finite(card.value)).reduce((sum, card) => sum + card.value, 0);
-    const breachScore = spread.total_value
-      ? 100 - (breachedValue / spread.total_value) * 100
-      : (cards.length ? 100 - (cards.filter((card) => card.sell.triggered.length).length / cards.length) * 100 : null);
+    const coverage = {
+      submitted,
+      matched: cards.filter((card) => card.coverage.matched).length,
+      valid_quantity: cards.filter((card) => card.coverage.valid_quantity).length,
+      valued: valuedCards.length,
+      stale_priced: cards.filter((card) => card.coverage.stale_priced).length,
+      scorable: scorableCards.length,
+      rules_known: cards.filter((card) => card.coverage.rules_known).length,
+      unresolved,
+      valued_share: valuedTotal > 0 && scorableValue > 0 ? (scorableValue / valuedTotal) * 100 : null,
+    };
+
+    const holdingsScore = scorableValue > 0
+      ? scorableCards.reduce((total, card) => total + card.score * (card.value / scorableValue), 0)
+      : null;
+    // Concentration needs a known total exposure. For a whole-portfolio grade that means
+    // every submitted position; for an explicitly labelled subset it means every position
+    // in the subset — the coverage line says which population the number covers.
+    const subsetRequested = options.subset === true;
+    const allValued = valuedCards.length > 0
+      && valuedCards.length === (subsetRequested ? valuedCards.length : submitted);
+    const concentrationScore = allValued ? spread.score : null;
+    const concentrationReason = !allValued
+      ? `${submitted - valuedCards.length} of ${submitted} positions have no usable price, `
+        + "so total exposure is unknown"
+      : valuedCards.length < submitted
+        ? `computed over the ${valuedCards.length} valued positions only`
+        : spread.reason;
+    const ruleCards = valuedCards.filter((card) => card.coverage.rules_known);
+    const ruleTotal = ruleCards.reduce((total, card) => total + card.value, 0);
+    const breachedValue = ruleCards.filter((card) => card.sell.triggered.length)
+      .reduce((total, card) => total + card.value, 0);
+    const breachScore = valuedTotal > 0 && ruleTotal > 0
+      ? 100 - (breachedValue / ruleTotal) * 100 : null;
+    const breachReason = valuedTotal > 0 && ruleTotal > 0 ? null
+      : "no valued position has a single known sell-rule input";
+
     const parts = [];
     if (finite(holdingsScore)) parts.push(["holdings", holdingsScore]);
-    if (finite(spread.score)) parts.push(["concentration", spread.score]);
+    if (finite(concentrationScore)) parts.push(["concentration", concentrationScore]);
     if (finite(breachScore)) parts.push(["breaches", breachScore]);
     const weight = parts.reduce((total, [key]) => total + PORTFOLIO_WEIGHTS[key], 0);
-    const score = weight
-      ? parts.reduce((total, [key, value]) => total + PORTFOLIO_WEIGHTS[key] * value, 0) / weight
-      : null;
+
+    let status;
+    let reason = null;
+    if (!submitted) {
+      status = "insufficient_data";
+      reason = "no position was submitted";
+    } else if (!coverage.scorable) {
+      status = "insufficient_data";
+      reason = `none of the ${submitted} positions could be valued and scored against this snapshot`;
+    } else if (coverage.scorable === submitted) {
+      status = "ok";
+    } else if (subsetRequested) {
+      status = "subset";
+    } else {
+      status = "partial";
+      reason = `${submitted - coverage.scorable} of ${submitted} positions are unresolved, so no `
+        + "whole-portfolio grade is published";
+    }
+
+    let score = null;
+    if ((status === "ok" || status === "subset") && weight) {
+      if (parts.length >= MIN_COMPONENTS) {
+        score = parts.reduce((total, [key, value]) => total + PORTFOLIO_WEIGHTS[key] * value, 0) / weight;
+      } else {
+        reason = `only ${parts.length} of 3 grade components could be computed `
+          + `(${parts.map(([key]) => key).join(", ") || "none"}), so no grade is published`;
+      }
+    }
+    const published = finite(score);
+
     return {
       as_of: options.asOf || null,
+      version: 2,
+      status,
+      subset: status === "subset",
       cards,
-      concentration: spread,
-      score: finite(score) ? Math.round(score * 10) / 10 : null,
-      grade: grade(score),
-      components: parts.map(([key, value]) => ({ key, value: Math.round(value * 10) / 10,
-        weight: PORTFOLIO_WEIGHTS[key] / weight })),
+      concentration: { ...spread, score: concentrationScore, reason: concentrationReason },
+      coverage,
+      score: published ? Math.round(score * 10) / 10 : null,
+      grade: published ? grade(score) : null,
+      components: published
+        ? parts.map(([key, value]) => ({ key, value: Math.round(value * 10) / 10,
+          weight: PORTFOLIO_WEIGHTS[key] / weight }))
+        : [],
+      available_components: parts.map(([key, value]) => ({ key, value: Math.round(value * 10) / 10 })),
+      breaches: { score: breachScore, reason: breachReason,
+        valued_total: valuedTotal, breached_value: breachedValue },
       counts: {
         positions: cards.length,
-        unmatched: cards.filter((card) => card.missing).length,
+        unmatched: cards.filter((card) => !card.coverage.matched).length,
         sell: cards.filter((card) => card.action.state === "sell-rule triggered").length,
         watch: cards.filter((card) => card.action.state === "watch").length,
         hold: cards.filter((card) => card.action.state === "hold").length,
       },
-      reason: parts.length ? null : "no holding could be scored against this snapshot",
+      reason,
     };
   }
 
@@ -347,24 +511,33 @@ const Portfolio = (() => {
      The site and the local app pass their own escaping/formatting helpers and get
      byte-identical markup, so the two clients cannot drift apart. ``helpers`` needs
      ``esc``, ``fmt(value, digits)``, ``signed(value)``, ``cls(value)`` and
-     ``url(path)``. */
+     ``url(path)``. ``stockUrl(symbol)`` is optional: a client that knows which symbols
+     own a full page passes it so every link resolves; without it the caller's own
+     ``url`` rewrite applies, exactly as before. */
   function renderers(helpers) {
     const { esc, fmt, signed, cls, url } = helpers;
     const money = (value, digits = 2) => (finite(value) ? `₹${fmt(value, digits)}` : "–");
-    const link = (symbol) => `<a class="list-symbol" href="${esc(url(`/s/${symbol}.html`))}">${esc(symbol)}</a>`;
+    const href = (symbol) => (typeof helpers.stockUrl === "function"
+      ? helpers.stockUrl(symbol) : url(`/s/${symbol}.html`));
+    const link = (symbol) => `<a class="list-symbol" href="${esc(href(symbol))}">${esc(symbol)}</a>`;
     /* A row inside one of the reader's own lists links with that list as its keyboard
        context, so Space/→ walks Favorites exactly as it walks a published list. */
     const contextLink = (listId, symbol, index) => (helpers.contextUrl
       ? `<a class="list-symbol" href="${esc(helpers.contextUrl(listId, symbol, index))}">${esc(symbol)}</a>`
       : link(symbol));
 
+    /* A rule this snapshot cannot answer reads "unknown". A set of unknown rules is
+       never summarised as "clear" — that was the fifth audit's A4 in miniature. */
     function sellCell(card) {
       if (card.sell.triggered.length) {
         return `<span class="negative">${esc(card.sell.triggered.map((rule) => rule.label).join("; "))}</span>`;
       }
+      if (card.sell.unknown.length === card.sell.rules.length) {
+        return '<span class="muted">unknown — no sell-rule input in this snapshot</span>';
+      }
       return card.sell.unknown.length
-        ? `<span class="muted">clear (${card.sell.unknown.length} inputs unknown)</span>`
-        : `<span class="positive">clear</span>`;
+        ? `<span class="muted">not triggered (${card.sell.unknown.length} inputs unknown)</span>`
+        : '<span class="positive">not triggered</span>';
     }
 
     function holdingsTable(cards) {
@@ -409,13 +582,46 @@ const Portfolio = (() => {
     function evaluation(result) {
       if (!result.cards.length) return `<p class="list-empty">No positions to evaluate yet.</p>`;
       const spread = result.concentration;
-      const weight = (card) => (spread.total_value && finite(card.value)
+      const coverage = result.coverage || { submitted: result.cards.length, unresolved: [] };
+      const unresolved = coverage.unresolved || [];
+      const weight = (card) => (finite(card.value) && spread.total_value
         ? `${fmt((card.value / spread.total_value) * 100, 1)}%` : "–");
-      const summary = `<div class="evaluation-summary">
-        <div class="evaluation-grade"><span>Portfolio grade</span><b>${esc(result.grade || "–")}</b>
-          <em>${result.score === null ? "no score" : `${fmt(result.score, 1)} / 100`}</em></div>
+      const policy = "Policy: a position counts only when this snapshot carries a row, a "
+        + "quantity above zero and a fresh close. Unknown is neither failed nor clear, an "
+        + "unpriced position makes total exposure unknown, and a grade needs at least two "
+        + "components.";
+      const counts = `Coverage: ${coverage.submitted} submitted · ${coverage.matched} matched · `
+        + `${coverage.valid_quantity} with a usable quantity · ${coverage.valued} valued · `
+        + `${coverage.stale_priced} stale-priced · ${coverage.scorable} scorable · `
+        + `${coverage.rules_known} with a known sell rule.`;
+      const list = unresolved.map((entry) => `${entry.symbol} (${entry.reason})`).join(", ");
+      const resolved = coverage.submitted - unresolved.length;
+      const banner = result.status === "insufficient_data"
+        ? `<div class="evaluation-banner negative"><b>Cannot evaluate</b>
+            <p>${esc(result.reason || "nothing in this input could be scored against this snapshot.")}</p>
+            ${unresolved.length ? `<p class="fineprint">${esc(list)}</p>` : ""}</div>`
+        : result.status === "partial"
+          ? `<div class="evaluation-banner negative"><b>Portfolio grade withheld</b>
+              <p>${unresolved.length} of ${coverage.submitted} positions unresolved: ${esc(list)}</p>
+              <button type="button" data-evaluation-subset="1">Evaluate the ${resolved} resolved
+                positions as a subset</button></div>`
+          : result.status === "subset"
+            ? `<div class="evaluation-banner"><b>Subset grade ${esc(result.grade || "–")}</b>
+                <p>${result.score === null ? "no score" : `${fmt(result.score, 1)} / 100`} ·
+                covers ${coverage.scorable} of ${coverage.submitted} positions
+                (${coverage.valued_share === null ? "unknown" : `${fmt(coverage.valued_share, 1)} %`}
+                of resolved value)</p>
+                ${unresolved.length ? `<p class="fineprint">Excluded: ${esc(list)}</p>` : ""}</div>`
+            : "";
+      const headline = result.grade === null
+        ? `<div class="evaluation-grade"><span>Portfolio grade</span><b>–</b>
+            <em>${esc(result.status === "insufficient_data" ? "not evaluated" : "withheld")}</em></div>`
+        : `<div class="evaluation-grade"><span>${result.status === "subset" ? "Subset grade" : "Portfolio grade"}</span>
+            <b>${esc(result.grade)}</b><em>${fmt(result.score, 1)} / 100</em></div>`;
+      const summary = `<div class="evaluation-summary">${banner}${headline}
         <div class="geometry-grid">
           <div class="brief-metric"><span>Positions</span><b>${result.counts.positions}</b></div>
+          <div class="brief-metric"><span>Valued</span><b>${coverage.valued}</b></div>
           <div class="brief-metric"><span>Sell-rule triggered</span>
             <b class="${result.counts.sell ? "negative" : "positive"}">${result.counts.sell}</b></div>
           <div class="brief-metric"><span>Watch</span><b>${result.counts.watch}</b></div>
@@ -428,10 +634,13 @@ const Portfolio = (() => {
         <p class="fineprint">Grade = ${result.components.map((part) =>
           `${esc(part.key)} ${fmt(part.value, 1)} × ${fmt(part.weight * 100, 0)}%`).join(" + ")
           || "no component available"}. Bands A ≥ 85 · B ≥ 70 · C ≥ 55 · D ≥ 40 · E below.
-          ${esc(result.reason || "")}</p></div>`;
+          ${esc(result.reason || "")}</p>
+        <p class="fineprint">${esc(counts)}</p>
+        <p class="fineprint">${esc(policy)}</p></div>`;
       const cards = result.cards.map((card) => `<article class="evaluation-card">
         <header>${link(card.symbol)}<b class="grade-${esc(card.grade || "none")}">${esc(card.grade || "–")}</b></header>
-        <p class="muted">${esc(card.name)}${card.missing ? ` — ${esc(card.reason)}` : ""}</p>
+        <p class="muted">${esc(card.name)}${card.unresolved_reason ? ` — ${esc(card.unresolved_reason)}` : ""}
+          ${card.lots > 1 ? `<small>lots: ${card.lots}</small>` : ""}</p>
         <dl>
           <div><dt>Composite</dt><dd>${fmt(card.ratings.composite, 0)}</dd></div>
           <div><dt>RS</dt><dd>${fmt(card.ratings.rs, 0)}</dd></div>
@@ -449,7 +658,7 @@ const Portfolio = (() => {
           ${esc(card.action.state)} — ${esc(card.action.why)}</p>
         <ul class="sell-rules">${card.sell.rules.map((rule) => `<li class="${rule.state === true
           ? "negative" : rule.state === false ? "positive" : "muted"}">${esc(rule.label)}: ${rule.state === true
-          ? "breached" : rule.state === false ? "clear" : "unknown"} <small>${esc(rule.detail)}</small></li>`).join("")}</ul>
+          ? "triggered" : rule.state === false ? "not triggered" : "unknown"} <small>${esc(rule.detail)}</small></li>`).join("")}</ul>
         </article>`).join("");
       return `${summary}<div class="evaluation-cards">${cards}</div>`;
     }
@@ -489,7 +698,7 @@ const Portfolio = (() => {
     NO_EPS_CALENDAR, AI_EVALUATION_LIMIT,
     grade, stageNumber, index, sellRules, stopOf, gainPct, distanceToStop, buyRange,
     holdingCard, currentHoldings, sellWatchlist, buyWatchlist, stockScore, action,
-    concentration, evaluate, parseHoldings, renderers,
+    concentration, evaluate, mergeHoldings, quantityReason, parseHoldings, renderers,
   };
 })();
 if (typeof module !== "undefined" && module.exports) module.exports = Portfolio;

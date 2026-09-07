@@ -326,9 +326,12 @@ function renderRows(resetPage = true) {
     const staleBadge = row.stale === true ? `<span class="stale-badge" title="${esc(`stale — last data ${row.last_date || "unknown"}`)}">●</span>` : "";
     const pivot = pivotDisplay(row);
     const symbol = String(row.symbol || "");
-    const symbolMarkup = row.has_page
-      ? `<a class="scan-symbol" href="${siteUrl(`/s/${encodeURIComponent(symbol)}.html`)}">${esc(symbol)}</a>`
-      : `<span class="scan-symbol scan-symbol-static" title="Deep dive not included for this row">${esc(symbol)}</span>`;
+    // Every scanned row has a destination: the deep dive when it has one, the generic
+    // technical view otherwise.
+    const symbolMarkup = `<a class="scan-symbol${row.has_page ? "" : " scan-symbol-technical"}" `
+      + `href="${esc(Lists.stockHref(symbol, basePath(), row))}"`
+      + `${row.has_page ? "" : ' title="Technical view: this row has no financial deep dive"'}`
+      + `>${esc(symbol)}</a>`;
     return `<tr class="${row.stale === true ? "scan-row-stale" : ""}">
       <td>${symbolMarkup}${newBadge}${staleBadge}<span class="scan-name" title="${esc(row.name || "")}">${esc(row.name || "")}</span></td>
       <td>₹${fmt(row.close, 2)}</td><td class="${cls(row.chg_pct)}">${signed(row.chg_pct)}</td>
@@ -456,6 +459,15 @@ function initScreener() {
   bindScreener();
   renderFilterControls();
   initCategories();
+  // ?q=SYM prefills the search box, so a symbol that has no page is never dropped when
+  // the technical view sends the reader back here.
+  const requested = new URLSearchParams(window.location.search).get("q");
+  if (requested) {
+    const search = $("scan-search");
+    if (search) search.value = requested;
+    filters.query = requested;
+    saveFilters();
+  }
   $("scan-load").addEventListener("click", loadScreener);
   document.querySelectorAll("[data-preset-jump]").forEach((button) => button.addEventListener("click", () => {
     const key = button.dataset.presetJump;
@@ -508,42 +520,108 @@ async function fetchJson(path) {
   return response.json();
 }
 
+function pageBuildId() {
+  return String((document.documentElement.dataset || {}).buildId || "");
+}
+
+function basePath() {
+  return (document.documentElement.dataset || {}).basePath || "";
+}
+
+/* The route manifest: which symbols own a full research page and which resolve through
+   the generic technical route. Fetched once per page, then held in memory. */
+let routePages = null;
+let routesPromise = null;
+
+async function loadRoutes(path = "/data/routes.json") {
+  if (routePages) return routePages;
+  if (!routesPromise) {
+    routesPromise = fetchJson(path).then((payload) => {
+      const map = {};
+      for (const symbol of payload.full || []) map[String(symbol)] = "full";
+      for (const symbol of payload.technical || []) map[String(symbol)] = "technical";
+      routePages = map;
+      return map;
+    }).catch(() => { routePages = {}; return routePages; });
+  }
+  return routesPromise;
+}
+
+function parseSortParam(value) {
+  const text = String(value || "");
+  const separator = text.lastIndexOf(":");
+  if (separator <= 0) return null;
+  const key = text.slice(0, separator);
+  const direction = text.slice(separator + 1);
+  if (!/^[A-Za-z0-9_]+$/.test(key)) return null;
+  if (direction !== "asc" && direction !== "desc") return null;
+  return { key, direction };
+}
+
 function readListParams() {
   const params = new URLSearchParams(window.location.search);
   const id = params.get("list");
   const index = Number.parseInt(params.get("i"), 10);
-  if (id) return { id, index: Number.isInteger(index) ? index : -1, fallback: false };
+  const sort = parseSortParam(params.get("sort"));
+  if (id) return { id, index: Number.isInteger(index) ? index : -1, sort, fallback: false };
   try {
     const stored = JSON.parse(sessionStorage.getItem(LIST_CONTEXT_KEY) || "null");
-    if (stored && stored.id) return { ...stored, fallback: false };
+    // A session entry from another contract version or another build is discarded, not
+    // migrated: it would point into an order this build no longer publishes.
+    const usable = stored && stored.id && stored.version === MSChart.LIST_CONTEXT_VERSION
+      && (!stored.build_id || !pageBuildId() || stored.build_id === pageBuildId());
+    if (usable) {
+      return { id: stored.id, index: Number.isInteger(stored.index) ? stored.index : -1,
+        sort: MSChart.listSort(stored.sort), fallback: false };
+    }
   } catch { /* a corrupt session entry is simply no context */ }
-  return { id: DEFAULT_LIST, index: -1, fallback: true };
+  return { id: DEFAULT_LIST, index: -1, sort: null, fallback: true };
 }
 
 async function loadListContext(symbol) {
   const requested = readListParams();
   // "my:<id>" is one of the reader's own lists: it lives in this browser, not in the
-  // published snapshot, so it is read from the store instead of fetched.
+  // published snapshot, so it is read from the store instead of fetched. Its routes come
+  // from the published route manifest, because an imported symbol may be anything.
   if (String(requested.id).startsWith("my:")) {
     const list = MyLists.get(lists(), String(requested.id).slice(3));
     if (list) {
+      const pages = await loadRoutes();
       const context = MSChart.listContext({ id: requested.id, title: list.title,
-        symbols: list.items.map((item) => item.symbol), index: requested.index }, symbol);
+        build_id: pageBuildId(), symbols: list.items.map((item) => item.symbol),
+        index: requested.index, sort: requested.sort, pages }, symbol);
       context.fallback = false;
       return context;
     }
-    return { id: null, title: null, symbols: [], index: -1, position: null, fallback: true,
+    return { version: MSChart.LIST_CONTEXT_VERSION, id: null, title: null, symbols: [], index: -1,
+      position: null, sort: null, pages: null, unresolved: [], fallback: true,
       error: `${requested.id} is not a list in this browser` };
   }
   try {
     const payload = await fetchJson(`/data/lists/${requested.id}.json`);
+    const rows = payload.rows || [];
+    const present = new Set(rows.map((row) => String(row.symbol)));
+    const pages = {};
+    for (const row of rows) pages[String(row.symbol)] = row.page || (row.has_page ? "full" : "technical");
+    // The context follows what the reader is looking at: the sorted order when a sort is
+    // set, otherwise the published order, in both cases only over rows this build carries.
+    const extrasFor = (row) => ({ included_in: (payload.included_in || {})[row.symbol] });
+    const published = (payload.symbols || []).map(String);
+    const symbols = !rows.length ? published
+      : requested.sort
+        ? Lists.sortRows(rows, requested.sort.key, requested.sort.direction, extrasFor)
+          .map((row) => String(row.symbol))
+        : published.filter((entry) => present.has(entry));
     const context = MSChart.listContext(
-      { id: payload.id, title: payload.title, symbols: payload.symbols, index: requested.index },
+      { id: payload.id, title: payload.title, build_id: payload.build_id, symbols,
+        index: requested.index, sort: requested.sort, pages,
+        unresolved: payload.missing_symbols || [] },
       symbol);
     context.fallback = requested.fallback;
     return context;
   } catch {
-    return { id: null, title: null, symbols: [], index: -1, position: null, fallback: true,
+    return { version: MSChart.LIST_CONTEXT_VERSION, id: null, title: null, symbols: [], index: -1,
+      position: null, sort: null, pages: null, unresolved: [], fallback: true,
       error: `list ${requested.id} is not published in this snapshot` };
   }
 }
@@ -557,8 +635,10 @@ function renderListNav(context) {
   }
   const suffix = context.fallback ? ` · default list (${context.title || context.id})`
     : ` in ${context.title || context.id}`;
-  label.textContent = context.position ? `${context.position}${suffix}`
-    : `not in ${context.title || context.id}`;
+  const sorted = context.sort ? ` · sorted by ${context.sort.key} ${context.sort.direction}` : "";
+  const unresolved = context.unresolvedNote ? ` · ${context.unresolvedNote}` : "";
+  label.textContent = (context.position ? `${context.position}${suffix}`
+    : `not in ${context.title || context.id}`) + sorted + unresolved;
 }
 
 function gotoListEntry(context, result) {
@@ -571,9 +651,13 @@ function gotoListEntry(context, result) {
     return false;
   }
   try {
-    sessionStorage.setItem(LIST_CONTEXT_KEY, JSON.stringify({ id: context.id, index: result.index }));
+    sessionStorage.setItem(LIST_CONTEXT_KEY, JSON.stringify({
+      version: MSChart.LIST_CONTEXT_VERSION, id: context.id, sort: context.sort,
+      index: result.index, build_id: pageBuildId(),
+    }));
   } catch { /* private mode: navigation still works through the query string */ }
-  window.location.href = siteUrl(`/s/${result.symbol}.html?list=${encodeURIComponent(context.id)}&i=${result.index}`);
+  window.location.href = Lists.listLink(context.id, context.symbols, result.symbol, basePath(),
+    { sort: context.sort, pages: context.pages });
   return true;
 }
 
@@ -598,7 +682,9 @@ function toggleListDrawer(context) {
   drawer.id = "list-drawer";
   drawer.className = "list-drawer";
   const items = context.symbols.map((symbol, index) =>
-    `<li${index === context.index ? ' class="current"' : ""}><a href="${esc(siteUrl(`/s/${symbol}.html?list=${encodeURIComponent(context.id)}&i=${index}`))}">${esc(symbol)}</a></li>`).join("");
+    `<li${index === context.index ? ' class="current"' : ""}><a href="${esc(Lists.listLink(
+      context.id, context.symbols, symbol, basePath(),
+      { sort: context.sort, pages: context.pages }))}">${esc(symbol)}</a></li>`).join("");
   drawer.innerHTML = `<h3>${esc(context.title || context.id || "List")}</h3><ol>${items}</ol>`;
   document.body.appendChild(drawer);
   drawer.querySelector("li.current")?.scrollIntoView({ block: "center" });
@@ -647,28 +733,50 @@ async function initStock() {
   const gotoTab = bindTabs();
   setPanel(panelOpen());
   $("toggle-panel")?.addEventListener("click", () => setPanel(document.querySelector(".chart-layout")?.classList.contains("panel-hidden")));
+  await initChart(config, context, { container, move, gotoTab });
+}
+
+/* One chart initialiser for both stock routes (SPEC-AG §4.3).
+
+   ``config`` is the full page's ``#stock-data`` payload or the equivalent assembled from
+   ``data/stock/<SYM>.json`` on the technical page; ``mount`` carries the chart container
+   and the two page callbacks (list navigation and tab activation). When
+   ``config.weeklyPath`` is null the weekly view is aggregated from the same daily
+   history, so both pages read one canonical series. */
+async function initChart(config, context, mount = {}) {
+  const container = mount.container || $("chart");
+  const move = typeof mount.move === "function" ? mount.move : () => {};
+  const gotoTab = typeof mount.gotoTab === "function" ? mount.gotoTab : () => {};
+  const symbol = String(config.symbol || "");
+  if (!container) return;
 
   let daily = [];
   let weekly = [];
+  let seriesReference = null;
   let indexCloses = new Map();
   let rsCloses = new Map();
   try {
     const series = await fetchJson(config.seriesPath);
     daily = Array.isArray(series) ? series : series.bars || [];
+    seriesReference = Array.isArray(series) ? null : series.reference || null;
     checkBuildId(series.build_id, daily.length ? daily[daily.length - 1][0] : null);
     if (series.note) {
       const note = document.createElement("p");
       note.className = "fineprint"; note.textContent = series.note;
-      container.parentElement.appendChild(note);
+      (container.parentElement || container).appendChild(note);
     }
   } catch (error) {
     container.innerHTML = `<div class="chart-loading muted">Price series missing from this snapshot: ${esc(error.message)}</div>`;
     return;
   }
-  try {
-    const payload = await fetchJson(config.weeklyPath);
-    weekly = payload.bars || [];
-  } catch { weekly = MSChart.aggregate(daily, "W"); }
+  if (config.weeklyPath) {
+    try {
+      const payload = await fetchJson(config.weeklyPath);
+      weekly = payload.bars || [];
+    } catch { weekly = MSChart.aggregate(daily, "W"); }
+  } else {
+    weekly = MSChart.aggregate(daily, "W");
+  }
   for (const [path, target] of [[config.indexPath, "index"], [config.rsIndexPath, "rs"]]) {
     if (!path) continue;
     try {
@@ -721,10 +829,31 @@ async function initStock() {
   const pattern = (config.qualification && config.qualification.pattern) || {};
   const pivot = pattern.id ? pattern.pivot : null;
   const priceLines = [];
-  const drawPriceLine = (price, options) => {
+  const drawPriceLine = (price, options, sink = priceLines) => {
     if (!Number.isFinite(price)) return;
-    priceLines.push(candles.createPriceLine({ price, ...options }));
+    sink.push(candles.createPriceLine({ price, ...options }));
   };
+  /* The 52-week lines come from the published reference and are drawn once, outside the
+     timeframe switch: the same named level on D, W and M. Nothing recomputes them from
+     the bars that happen to be loaded. */
+  const priceReference = MSChart.referenceModel(seriesReference || config.reference);
+  const referenceLines = [];
+  if (priceReference.available) {
+    drawPriceLine(priceReference.high, { color: "#3a4756", lineWidth: 1, lineStyle: 3,
+      axisLabelVisible: true, title: priceReference.highTitle }, referenceLines);
+    drawPriceLine(priceReference.low, { color: "#3a4756", lineWidth: 1, lineStyle: 3,
+      axisLabelVisible: true, title: priceReference.lowTitle }, referenceLines);
+  }
+  const setFineprint = (id, text) => { const target = $(id); if (target) target.textContent = text || ""; };
+  /* RS-line events: computed once, from the canonical daily history and the daily
+     benchmark closes. A timeframe switch only changes which bar carries the marker. */
+  const rsEventState = MSChart.rsEvents(daily, rsCloses, { lookback: MSChart.RS_LOOKBACK.D });
+  setFineprint("chart-events", rsEventState.status === "ok"
+    ? `RS-line events: ${rsEventState.events.length} full-window highs `
+      + `(${rsEventState.lookback} aligned sessions, benchmark Nifty 500, hash ${rsEventState.input_hash}). `
+      + "A weekly or monthly marker means at least one session in that period closed the RS line at a "
+      + `${rsEventState.lookback}-session high.`
+    : `RS-line events: none — ${rsEventState.note} (benchmark Nifty 500, hash ${rsEventState.input_hash}).`);
   let timeframe = storedTimeframe();
   let indexVisible = false;
   let bars = [];
@@ -749,18 +878,20 @@ async function initStock() {
       series.setData(bars.map((bar, position) => values[position] === null
         ? null : { time: bar[0], value: values[position] }).filter(Boolean));
     });
-    const rs = MSChart.rsLine(bars, rsCloses, { lookback: MSChart.RS_LOOKBACK[timeframe] });
+    const rs = MSChart.rsLine(bars, rsCloses);
     rsSeries.setData(rs.points.map((point) => ({ time: point.time, value: point.value })));
     const rating = (config.ratings_compact || {}).rs;
-    const markers = rs.highs.map((point) => ({ time: point.time, position: "belowBar",
-      color: "#2ee6a8", shape: "circle", size: 0.6 }));
-    if (rs.points.length && rating) {
-      markers.push({ time: rs.points[rs.points.length - 1].time, position: "belowBar",
-        color: "#2ee6a8", shape: "arrowUp", text: `RS ${rating}` });
-    }
+    // The events come from the daily history; only their placement follows the timeframe.
+    const eventMarkers = MSChart.eventMarkers(rsEventState, bars, timeframe);
+    const latest = rs.points.length && rating
+      ? [{ time: rs.points[rs.points.length - 1].time, position: "belowBar", color: "#2ee6a8",
+          shape: "arrowUp", text: `RS ${rating}`, kind: "rs_latest" }]
+      : [];
     const legMarkers = Screener.legMarkers(config.reference_pattern ? [] : config.legs,
-      bars.map((bar) => bar[0]));
-    candles.setMarkers([...legMarkers, ...markers]);
+      bars.map((bar) => bar[0])).map((marker) => ({ ...marker, kind: "leg" }));
+    const markers = MSChart.sortedMarkers(legMarkers, eventMarkers, latest);
+    MSChart.assertSortedMarkers(markers);
+    candles.setMarkers(markers);
     indexSeries.setData(indexVisible
       ? bars.map((bar) => (indexCloses.has(String(bar[0]))
         ? { time: bar[0], value: indexCloses.get(String(bar[0])) } : null)).filter(Boolean)
@@ -772,9 +903,19 @@ async function initStock() {
     const reference = config.reference_pattern?.pivot ?? (!pattern.id ? config.geometry_pivot : null);
     if (Number.isFinite(reference)) drawPriceLine(reference, { color: "#f5a623", lineWidth: 1, lineStyle: 2,
       title: config.reference_pattern ? "power play · flag forming" : "geometry pivot" });
-    const labels = MSChart.priceLabels(bars);
-    drawPriceLine(labels.high, { color: "#3a4756", lineWidth: 1, lineStyle: 3, axisLabelVisible: true, title: "52w high" });
-    drawPriceLine(labels.low, { color: "#3a4756", lineWidth: 1, lineStyle: 3, axisLabelVisible: true, title: "52w low" });
+    const loaded = MSChart.loadedRange(bars);
+    setFineprint("chart-reference", [
+      priceReference.available
+        ? `${priceReference.note} · lines drawn on every timeframe from the same window`
+        : priceReference.note,
+      Number.isFinite(loaded.high) && Number.isFinite(loaded.low)
+        ? `loaded-range high ₹${fmt(loaded.high, 2)} · loaded-range low ₹${fmt(loaded.low, 2)} (${loaded.bars} ${timeframe} bars)`
+        : null,
+      MSChart.partialLastNote(daily, timeframe, config.as_of || priceReference.asOf),
+    ].filter(Boolean).join(" · "));
+    setFineprint("panel-reference-window", priceReference.available
+      ? `${priceReference.window || "window unknown"} · ${priceReference.status}`
+      : "no dated 52-week window in this snapshot");
     chart.timeScale().fitContent();
     positionBand();
     renderDrawings();
@@ -966,6 +1107,189 @@ async function initStock() {
   requestAnimationFrame(() => requestAnimationFrame(() => { positionBand(); renderDrawings(); }));
 }
 
+/* ── the generic technical route (SPEC-AG §4.2) ───────────────────────────────
+   One page serves every scanned symbol that has no full research page. It renders from
+   data/stock/<SYM>.json and data/series/<SYM>.json, states its own coverage, and — when
+   the symbol is not in the snapshot at all — says so with the symbol still in view. */
+const TECHNICAL_SYMBOL_RE = /^[A-Z0-9&._-]{1,20}$/;
+
+function technicalMetric(label, value, extra = "") {
+  return `<div><span>${esc(label)}</span><b>${esc(value)}</b>${extra ? `<em>${esc(extra)}</em>` : ""}</div>`;
+}
+
+function technicalNotFound(symbol, asOf) {
+  return `<h1>${esc(symbol)}</h1><p class="list-empty">${esc(symbol)} is not in this snapshot `
+    + `(as of ${esc(asOf || "unknown")}). It may be outside the scanned universe or excluded by `
+    + `the universe ledger.</p><p><a href="${esc(siteUrl(`/?q=${encodeURIComponent(symbol)}#screener`))}">`
+    + `Search the screener for ${esc(symbol)} →</a></p>`;
+}
+
+async function initTechnical() {
+  const configNode = $("technical-config");
+  if (!configNode) return;
+  let config = {};
+  try { config = JSON.parse(configNode.textContent); } catch { config = {}; }
+  const hero = $("technical-hero");
+  const heading = $("technical-symbol");
+  const chartCard = $("chart-card");
+  const requested = String(new URLSearchParams(window.location.search).get("symbol") || "")
+    .trim().toUpperCase();
+  const hide = (node) => { if (node) node.hidden = true; };
+  if (!requested || !TECHNICAL_SYMBOL_RE.test(requested)) {
+    if (heading) heading.textContent = "No symbol requested";
+    const name = $("technical-name");
+    if (name) {
+      name.innerHTML = `Open a stock from a list, or <a href="${esc(siteUrl("/#screener"))}">`
+        + "use the screener</a> to find one.";
+    }
+    for (const id of ["chart-card", "technical-financials", "technical-pattern", "technical-lists",
+      "stock-actions", "list-nav"]) hide($(id));
+    return;
+  }
+  document.title = `${requested} · technical view — SEPA Terminal`;
+  if (heading) heading.textContent = requested;
+
+  let stock = null;
+  try {
+    stock = await fetchJson(`${config.stockPath || "/data/stock/"}${encodeURIComponent(requested)}.json`);
+  } catch {
+    if (hero) hero.innerHTML = technicalNotFound(requested, config.as_of);
+    for (const id of ["chart-card", "technical-financials", "technical-pattern", "technical-lists"]) hide($(id));
+    return;
+  }
+  checkBuildId(stock.build_id, stock.last_date || config.as_of);
+  const symbol = String(stock.symbol || requested);
+  const ratings = stock.ratings || {};
+  const group = stock.group || {};
+  const qualification = stock.qualification || {};
+  const base = stock.base || {};
+  const power = stock.power_play || {};
+  if (heading) heading.textContent = symbol;
+  const name = $("technical-name");
+  if (name) name.textContent = stock.name || symbol;
+  const price = $("technical-price");
+  if (price) {
+    price.innerHTML = `<b>₹${fmt(stock.close, 2)}</b>`
+      + `<span class="${esc(cls(stock.chg_pct))}">${esc(signed(stock.chg_pct))}</span>`
+      + `<em class="hero-volume">${esc(stock.stage || "stage unknown")} · Trend Template `
+      + `${fmt((stock.tt || {}).passed, 0)}/8</em>`;
+  }
+  const actions = $("stock-actions");
+  if (actions) actions.dataset.symbol = symbol;
+  const metrics = $("technical-metrics");
+  if (metrics) {
+    metrics.innerHTML = [
+      technicalMetric("Relative strength", fmt(stock.rs, 0), `1w ${signed(stock.rs_chg_1w, "")}`),
+      technicalMetric("Composite (custom)", fmt(ratings.composite, 0), `EPS ${fmt(ratings.eps, 0)} · A/D ${ratings.ad || "–"}`),
+      technicalMetric("Industry group", group.name || "unmapped",
+        group.rank ? `rank ${group.rank} of ${group.of}` : "no ranked group"),
+      technicalMetric("Entry state", String(qualification.entry_state || "none").replace(/_/g, " "),
+        qualification.ready === true ? "Actionable" : "not actionable in this snapshot"),
+      technicalMetric("Lifecycle", String(base.lifecycle_state || base.status || "none").replace(/_/g, " "),
+        `${fmt(base.depth_pct, 1)}% depth`),
+      technicalMetric("Data stamp", stock.last_date || config.as_of || "–",
+        stock.stale === true ? "stale row" : "current snapshot"),
+    ].join("");
+  }
+  const status = $("technical-chart-status");
+  if (status) {
+    status.innerHTML = `<span class="chart-oh">OH ${esc(signed(stock.pct_off_high))}</span>`
+      + `<span class="chart-ol">OL ${esc(signed(stock.pct_above_low))}</span>`
+      + `<span class="chart-pivot">${esc(stock.pct_to_pivot === null || stock.pct_to_pivot === undefined
+        ? "no active pivot" : `${fmt(stock.pct_to_pivot, 1)}% to Pivot`)}</span>`;
+  }
+
+  initStockActions({ ...stock, symbol });
+  const context = await loadListContext(symbol);
+  renderListNav(context);
+  const move = bindListNavigation(context);
+  setPanel(panelOpen());
+  $("toggle-panel")?.addEventListener("click", () =>
+    setPanel(document.querySelector(".chart-layout")?.classList.contains("panel-hidden")));
+
+  const pattern = qualification.pattern || {};
+  const chartConfig = {
+    symbol, name: stock.name || symbol, as_of: config.as_of,
+    seriesPath: `${config.seriesPath || "/data/series/"}${encodeURIComponent(symbol)}.json`,
+    weeklyPath: null,
+    indexPath: config.indexPath || "/data/index/NIFTY50.json",
+    rsIndexPath: config.rsIndexPath || "/data/index/NIFTY500.json",
+    qualification, legs: base.legs || [], geometry_pivot: base.pivot_hint ?? null,
+    reference_pattern: !pattern.id && power.flag === true
+      ? { id: "power_play", pivot: power.pivot ?? null } : null,
+    ratings_compact: ratings, tick_size: stock.tick_size ?? null,
+  };
+  renderTechnicalPanel(stock);
+  const financials = $("technical-financials");
+  if (financials) {
+    const coverage = config.coverage || {};
+    financials.innerHTML = '<span class="eyebrow">FINANCIAL RECORD</span>'
+      + "<h2>Financial record</h2>"
+      + `<p>No financial deep dive for ${esc(symbol)} in this snapshot — full pages cover `
+      + `${fmt(coverage.full, 0)} of ${fmt(coverage.rows, 0)} symbols (Trend Template ≥ 6/8 and the `
+      + "turnover gate). Fundamentals: unknown, not failed.</p>"
+      + `<p class="fineprint"><a href="${esc(siteUrl(`/?q=${encodeURIComponent(symbol)}#screener`))}">`
+      + "Open this row in the screener →</a></p>";
+  }
+  const patternCard = $("technical-pattern");
+  if (patternCard) {
+    patternCard.innerHTML = '<span class="eyebrow">STRUCTURE</span><h2>Pattern read</h2>'
+      + '<div class="geometry-grid">'
+      + technicalMetric("Base status", String(base.status || "none").replace(/_/g, " "), "")
+      + technicalMetric("Contractions", (base.contraction_legs_pct || []).map((value) => `${fmt(value, 1)}%`).join(" → ") || "–", "")
+      + technicalMetric("Pivot", pattern.pivot ? `₹${fmt(pattern.pivot, 2)}` : (base.pivot_hint ? `₹${fmt(base.pivot_hint, 2)}` : "–"),
+        pattern.id ? "risk-approved pattern pivot" : "geometry pivot only")
+      + technicalMetric("Stop", pattern.stop ? `₹${fmt(pattern.stop, 2)}` : "–",
+        pattern.risk_pct ? `${fmt(pattern.risk_pct, 1)}% risk from pivot` : "no active pattern")
+      + "</div>";
+  }
+  const listsCard = $("technical-lists");
+  if (listsCard) {
+    const memberships = stock.lists || [];
+    listsCard.innerHTML = '<span class="eyebrow">MEMBERSHIP</span><h2>Lists this stock is in</h2>'
+      + (memberships.length
+        ? `<ul class="top-rs-list">${memberships.map((entry) =>
+          `<li><a href="${esc(siteUrl(`/lists/${entry.id}.html`))}">${esc(entry.title)}</a>`
+          + `<span>${esc(entry.section)}</span><b>${entry.index + 1} of ${entry.count}</b></li>`).join("")}</ul>`
+        : '<p class="muted">This symbol is not in any published list in this snapshot.</p>');
+  }
+  await initChart(chartConfig, context, { container: $("chart"), move, gotoTab: () => {} });
+  if (chartCard) chartCard.hidden = false;
+}
+
+/* The technical blocks of the full page's data panel, rendered from the compact row. */
+function renderTechnicalPanel(stock) {
+  const panel = $("data-panel");
+  if (!panel) return;
+  const facts = stock.facts || {};
+  const surveillance = stock.surveillance || {};
+  const line = (label, value, suffix = "") => `<div class="panel-line"><span>${esc(label)}</span>`
+    + `<b>${value === null || value === undefined || value === "" ? '<span class="na">n/a</span>'
+      : `${esc(value)}${esc(suffix)}`}</b></div>`;
+  const flagged = Object.entries(surveillance).filter(([, value]) => value === true)
+    .map(([key]) => key.replace(/_/g, " "));
+  panel.innerHTML = '<div class="panel-block"><h3>52-week reference</h3>'
+    + line("52-week high", facts.hi_52w === null || facts.hi_52w === undefined ? null : `₹${fmt(facts.hi_52w, 2)}`)
+    + line("52-week low", facts.lo_52w === null || facts.lo_52w === undefined ? null : `₹${fmt(facts.lo_52w, 2)}`)
+    + line("Off 52-week high", facts.off_52w_high_pct === null || facts.off_52w_high_pct === undefined ? null : fmt(facts.off_52w_high_pct, 1), "%")
+    + line("Above 52-week low", facts.above_52w_low_pct === null || facts.above_52w_low_pct === undefined ? null : fmt(facts.above_52w_low_pct, 1), "%")
+    + '<p class="fineprint" id="panel-reference-window"></p></div>'
+    + '<div class="panel-block"><h3>Liquidity</h3>'
+    + line("Average volume (50d)", facts.avg_volume_50d === null || facts.avg_volume_50d === undefined ? null : fmt(facts.avg_volume_50d, 0))
+    + line("Average ₹ volume (50d)", facts.avg_rupee_volume_cr === null || facts.avg_rupee_volume_cr === undefined ? null : `₹${fmt(facts.avg_rupee_volume_cr, 1)} Cr`)
+    + line("Turnover", stock.turnover_cr === null || stock.turnover_cr === undefined ? null : `₹${fmt(stock.turnover_cr, 1)} Cr`)
+    + line("Market cap", facts.market_cap_cr === null || facts.market_cap_cr === undefined ? null : `₹${fmt(facts.market_cap_cr, 0)} Cr`,
+      facts.market_cap_source ? ` (${facts.market_cap_source})` : "")
+    + "</div>"
+    + '<div class="panel-block"><h3>Behaviour</h3>'
+    + line("U/D Vol Ratio", facts.ud_vol_ratio === null || facts.ud_vol_ratio === undefined ? null : fmt(facts.ud_vol_ratio, 2))
+    + line("Alpha", facts.alpha === null || facts.alpha === undefined ? null : fmt(facts.alpha, 2), "%")
+    + line("Beta", facts.beta === null || facts.beta === undefined ? null : fmt(facts.beta, 2))
+    + line("Index membership", (stock.indices || []).join(", ") || null)
+    + line("Surveillance", flagged.join(", ") || (stock.surveillance_text || "no flag in this snapshot"))
+    + "</div>";
+}
+
 /* ── list pages ───────────────────────────────────────────────────────────── */
 function initSidebar() {
   const toggle = $("sidebar-toggle");
@@ -1019,29 +1343,37 @@ async function initList() {
   let sortKey = select ? select.value : payload.columns[0];
   let pageIndex = 1;
   const extrasFor = (row) => ({ included_in: (payload.included_in || {})[row.symbol] });
+  // The route each row resolves to, and the sort the reader is looking at: both travel
+  // with every link, so the keyboard context follows the visible order.
+  const pages = {};
+  for (const row of payload.rows || []) {
+    pages[String(row.symbol)] = row.page || (row.has_page ? "full" : "technical");
+  }
+  const currentSort = () => ({ key: sortKey, direction: Lists.defaultDirection(sortKey) });
+  const linkFor = (rows, symbol) => Lists.listLink(payload.id, rows.map((row) => String(row.symbol)),
+    String(symbol), document.documentElement.dataset.basePath || "",
+    { sort: currentSort(), pages });
 
   function ordered() {
     return Lists.sortRows(payload.rows, sortKey, Lists.defaultDirection(sortKey), extrasFor);
   }
 
-  function renderTable(rows) {
+  function renderTable(rows, all) {
     const head = payload.columns.map((key) => `<th>${esc((payload.column_labels || {})[key] || key)}</th>`).join("");
     const body = rows.map((row) => `<tr>${payload.columns.map((key) => {
       if (key === "symbol") {
-        const href = row.has_page ? Lists.listLink(payload.id, payload.symbols, row.symbol,
-          document.documentElement.dataset.basePath || "") : siteUrl("/#screener");
-        return `<td><a class="list-symbol" href="${esc(href)}">${esc(row.symbol)}</a></td>`;
+        return `<td><a class="list-symbol" href="${esc(linkFor(all, row.symbol))}">${esc(row.symbol)}</a></td>`;
       }
       return `<td>${esc(Lists.formatCell(row, key, extrasFor(row)))}</td>`;
     }).join("")}<td class="row-actions-cell">${listActionsHtml(row.symbol)}</td></tr>`).join("");
     return `<div class="detail-table-wrap"><table class="detail-table list-table"><thead><tr>${head}<th aria-label="My Lists"></th></tr></thead><tbody>${body}</tbody></table></div>`;
   }
 
-  function renderCards(rows) {
+  function renderCards(rows, all) {
     return `<div class="list-cards">${rows.map((row) => {
-      const card = Lists.cardModel(row, (payload.sparks || {})[row.symbol], extrasFor(row));
-      const href = row.has_page ? Lists.listLink(payload.id, payload.symbols, row.symbol,
-        document.documentElement.dataset.basePath || "") : siteUrl("/#screener");
+      const card = Lists.cardModel(row, (payload.sparks || {})[row.symbol], extrasFor(row),
+        document.documentElement.dataset.basePath || "", pages);
+      const href = linkFor(all, row.symbol);
       const spark = card.spark
         ? `<svg class="spark" viewBox="0 0 160 44" preserveAspectRatio="none"><polyline points="${esc(card.spark)}"/></svg>`
         : `<p class="spark-missing">no weekly series published for this symbol</p>`;
@@ -1055,7 +1387,7 @@ async function initList() {
   function draw() {
     const rows = ordered();
     const paged = Lists.page(rows, Lists.PAGE_SIZE, pageIndex);
-    target.innerHTML = view === "cards" ? renderCards(paged.rows) : renderTable(paged.rows);
+    target.innerHTML = view === "cards" ? renderCards(paged.rows, rows) : renderTable(paged.rows, rows);
     const more = $("list-more");
     if (more) {
       more.hidden = !paged.more;
@@ -1255,9 +1587,13 @@ function initStockActions(payload) {
 }
 
 /* ── §3 / §4 the browser-local pages ─────────────────────────────────────── */
+/* Every symbol a reader's own list can hold resolves through the published route
+   manifest: an imported symbol with no full page still opens its technical view. */
 const portfolioView = Portfolio.renderers({ esc, fmt, signed, cls, url: siteUrl,
-  contextUrl: (listId, symbol, index) =>
-    `${siteUrl(`/s/${symbol}.html`)}?list=${encodeURIComponent(`my:${listId}`)}&i=${index}` });
+  stockUrl: (symbol) => Lists.stockHref(symbol, basePath(), routePages),
+  contextUrl: (listId, symbol, index) => Lists.listLink(`my:${listId}`,
+    [String(symbol)], String(symbol), basePath(), { pages: routePages })
+    .replace(/&i=0$/, `&i=${index}`) });
 
 async function initUserPage() {
   const host = $("user-render");
@@ -1267,6 +1603,9 @@ async function initUserPage() {
   try { config = JSON.parse(configNode.textContent); } catch { config = {}; }
   const store = lists();
   renderSidebarCounts();
+  // The route manifest first: a reader's list can hold any symbol, and every one of them
+  // must link somewhere that resolves.
+  await loadRoutes(config.routesPath || "/data/routes.json");
 
   if (config.id === "my-lists") {
     const draw = () => { host.innerHTML = portfolioView.myLists(MyLists.listsOf(lists())); };
@@ -1367,12 +1706,28 @@ async function initUserPage() {
   }
   if (config.id === "portfolio-evaluation") {
     const status = $("evaluation-status");
-    const render = (holdings, note) => {
-      const result = Portfolio.evaluate(holdings, byId, { asOf: config.as_of });
+    const subsetButton = $("evaluation-subset");
+    let lastHoldings = [];
+    const render = (holdings, note, options = {}) => {
+      lastHoldings = holdings || [];
+      const result = Portfolio.evaluate(holdings, byId, { asOf: config.as_of, ...options });
       host.innerHTML = portfolioView.evaluation(result);
       if (status) status.textContent = note || "";
+      // The subset run is always the reader's explicit choice: a withheld grade never
+      // turns itself into a partial one.
+      if (subsetButton) {
+        subsetButton.hidden = result.status !== "partial";
+        const resolved = result.coverage.submitted - (result.coverage.unresolved || []).length;
+        subsetButton.textContent = `Evaluate the ${resolved} resolved positions as a subset`;
+      }
       return result;
     };
+    const runSubset = () => render(lastHoldings, "Subset evaluation over the resolved positions only.",
+      { subset: true });
+    subsetButton?.addEventListener("click", runSubset);
+    host.addEventListener("click", (event) => {
+      if (event.target?.closest?.("[data-evaluation-subset]")) { event.preventDefault(); runSubset(); }
+    });
     const fromText = () => {
       const parsed = Portfolio.parseHoldings($("evaluation-input").value, MyLists.parseCsv);
       return render(parsed.items, parsed.errors.length
@@ -1471,6 +1826,7 @@ initKeyHelp();
 renderSidebarCounts();
 if (document.body.dataset.page === "screener") initScreener();
 if (document.body.dataset.page === "stock") initStock();
+if (document.body.dataset.page === "technical") initTechnical();
 if (document.body.dataset.page === "list") initList();
 if (document.body.dataset.page === "user") initUserPage();
 if (document.body.dataset.page === "markets") initDeals();

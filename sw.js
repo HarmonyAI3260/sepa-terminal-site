@@ -5,10 +5,10 @@ const SCOPE = new URL(self.registration.scope);
 const CACHE_PREFIX = `sepa-terminal:${encodeURIComponent(SCOPE.pathname)}:`;
 // One cache per build id: a snapshot cached by an earlier build can never be served
 // beside this build's pages, whatever the app-shell digest says.
-const BUILD_ID = "91cb2da1b31b";
+const BUILD_ID = "4ccd7d5b07bb";
 const BUILD_PREFIX = `${CACHE_PREFIX}${BUILD_ID}:`;
-const CACHE_NAME = BUILD_PREFIX + "5eabd26b3e5f-b95fe0200f3d";
-const APP_SHELL = ["./", "index.html", "site.css", "site.js", "screener.js", "mschart.js", "lists.js", "mylists.js", "portfolio.js", "screenfilters.js", "manifest.webmanifest", "privacy.html", "offline.html", "404.html", "icons/icon-192.png", "icons/icon-512.png", "icons/maskable-192.png", "icons/maskable-512.png", "icons/apple-touch-icon.png", "icons/feature-graphic.png"];
+const CACHE_NAME = BUILD_PREFIX + "5eabd26b3e5f-0e41dd7e089a";
+const APP_SHELL = ["./", "index.html", "site.css", "site.js", "screener.js", "mschart.js", "lists.js", "mylists.js", "portfolio.js", "screenfilters.js", "manifest.webmanifest", "s/index.html", "vendor/lightweight-charts.standalone.production.js", "privacy.html", "offline.html", "404.html", "icons/icon-192.png", "icons/icon-512.png", "icons/maskable-192.png", "icons/maskable-512.png", "icons/apple-touch-icon.png", "icons/feature-graphic.png"];
 const SHELL_URLS = new Set(APP_SHELL.map(path => new URL(path, SCOPE).href));
 const OFFLINE_URL = new URL("offline.html", SCOPE).href;
 
@@ -38,6 +38,11 @@ function cacheKey(url) {
   key.search = "";
   // Share cached stock pages across the .html and directory-style public routes.
   const path = key.pathname.slice(SCOPE.pathname.length);
+  // The generic technical route: "s/", "s/index.html" and any ?symbol= query are all
+  // served by the one precached page.
+  if (path === "s" || path === "s/" || path === "s/index.html") {
+    return new URL("s/index.html", SCOPE).href;
+  }
   const stock = path.match(/^s\/([A-Z0-9][A-Z0-9&._-]*?)(?:\.html|\/(?:index\.html)?)?$/);
   if (stock) return new URL(`s/${stock[1]}.html`, SCOPE).href;
   if (path === "index.html") return SCOPE.href;
@@ -92,7 +97,13 @@ self.addEventListener("fetch", event => {
   // cache. Query-bearing requests never write to storage.
   if (navigation || snapshot) {
     event.respondWith(networkFirst(request, key, !url.search && (snapshot || shell), navigation));
-  } else if (shell && !url.search) {
-    event.respondWith(cacheFirst(request, key));
+  } else if (shell) {
+    // Shell assets are stamped ?v=<build id>. This build's own stamp names exactly the
+    // file that was precached, so it is served from the cache; any other stamp belongs to
+    // another build's page and must go to the network first, using the cache only when
+    // offline. An unstamped request keeps the original cache-first behaviour.
+    const stamp = url.searchParams.get("v");
+    if (!url.search || stamp === BUILD_ID) event.respondWith(cacheFirst(request, key));
+    else event.respondWith(networkFirst(request, key, false, false));
   }
 });

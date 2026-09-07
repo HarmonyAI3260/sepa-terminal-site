@@ -68,7 +68,9 @@ const MSChart = (() => {
   }
 
   /* The relative-strength line: stock close ÷ index close on shared dates,
-     rescaled into the lower third of the price pane so it can share one scale. */
+     rescaled into the lower third of the price pane so it can share one scale.
+     Drawing only — the economic event lives in ``rsEvents``, which always reads the
+     canonical daily history rather than whatever bars are on screen. */
   function rsLine(bars, indexCloses, options = {}) {
     const map = indexCloses instanceof Map ? indexCloses : new Map(Object.entries(indexCloses || {}));
     const raw = [];
@@ -78,7 +80,7 @@ const MSChart = (() => {
       if (close === null || index === null || index <= 0) continue;
       raw.push({ time: bar[0], ratio: close / index });
     }
-    if (raw.length < 2) return { points: [], highs: [], note: "not enough aligned index sessions" };
+    if (raw.length < 2) return { points: [], note: "not enough aligned index sessions" };
     const ratios = raw.map((point) => point.ratio);
     const min = Math.min(...ratios);
     const max = Math.max(...ratios);
@@ -92,16 +94,156 @@ const MSChart = (() => {
       value: floor + (point.ratio - min) * scale,
       ratio: point.ratio,
     }));
-    const lookback = options.lookback || RS_LOOKBACK.D;
-    const highs = [];
-    for (let index = 0; index < raw.length; index += 1) {
-      const window = raw.slice(Math.max(0, index - lookback + 1), index + 1);
-      if (window.length < Math.min(30, lookback) ) continue;
-      if (raw[index].ratio >= Math.max(...window.map((point) => point.ratio))) {
-        highs.push(points[index]);
+    return { points, note: `${points.length} aligned sessions` };
+  }
+
+  /* A short, deterministic provenance hash (FNV-1a, two offsets → 12 hex). Not a
+     cryptographic digest: it only has to change when the inputs change. */
+  function fnv1a12(text) {
+    let a = 0x811c9dc5;
+    let b = 0x01000193;
+    const source = String(text || "");
+    for (let index = 0; index < source.length; index += 1) {
+      const code = source.charCodeAt(index);
+      a = Math.imul(a ^ code, 0x01000193) >>> 0;
+      b = Math.imul(b ^ (code + index), 0x85ebca6b) >>> 0;
+    }
+    return a.toString(16).padStart(8, "0") + (b & 0xffff).toString(16).padStart(4, "0");
+  }
+
+  /* RS-line new highs, the scanner's definition (core/scanner.py _rs_line_signals):
+     aligned sessions = stock close > 0 and benchmark close > 0 on the same date;
+     an event on day t = ratio_t >= max(ratio over the last `lookback` aligned sessions
+     ending at t) AND at least `lookback` aligned sessions exist up to t.
+
+     A short history therefore produces no events at all: a 31-session "high" is not a
+     252-session high, and labelling it as one is what the fifth audit caught. Events are
+     always computed from the daily history and the daily benchmark closes, whatever
+     timeframe the chart is showing. */
+  function rsEvents(dailyBars, benchmarkCloses, options = {}) {
+    const lookback = Number.isFinite(Number(options.lookback)) ? Number(options.lookback) : RS_LOOKBACK.D;
+    const minAligned = Number.isFinite(Number(options.minAligned)) ? Number(options.minAligned) : 200;
+    const benchmark = options.benchmark || "NIFTY500";
+    const map = benchmarkCloses instanceof Map
+      ? benchmarkCloses : new Map(Object.entries(benchmarkCloses || {}));
+    const aligned = [];
+    for (const bar of dailyBars || []) {
+      const close = numeric(bar[4]);
+      const index = numeric(map.get(String(bar[0])));
+      if (close === null || index === null || close <= 0 || index <= 0) continue;
+      aligned.push({ date: String(bar[0]), ratio: close / index });
+    }
+    const count = aligned.length;
+    const hash = fnv1a12(aligned.map((point) => `${point.date}|${point.ratio}`).join("\n"));
+    const base = { events: [], aligned: count, benchmark, lookback, minAligned, input_hash: hash };
+    if (count < minAligned) {
+      return { ...base, status: "insufficient_alignment",
+        note: `only ${count} sessions align with ${benchmark} (at least ${minAligned} are needed `
+          + "before the RS line is read at all)" };
+    }
+    if (count < lookback) {
+      return { ...base, status: "young_listing",
+        note: `${count} aligned ${benchmark} sessions: RS-line markers start after ${lookback} `
+          + "aligned sessions, so this listing has none yet" };
+    }
+    // Sliding-window maximum over the last `lookback` aligned ratios, O(n).
+    const events = [];
+    const queue = [];
+    for (let index = 0; index < count; index += 1) {
+      while (queue.length && aligned[queue[queue.length - 1]].ratio <= aligned[index].ratio) queue.pop();
+      queue.push(index);
+      while (queue[0] <= index - lookback) queue.shift();
+      if (index >= lookback - 1 && queue[0] === index) {
+        events.push({ date: aligned[index].date, ratio: aligned[index].ratio, lookback,
+          observations: lookback, status: "full_history" });
       }
     }
-    return { points, highs, note: `${points.length} aligned sessions` };
+    return { ...base, events, status: "ok",
+      note: `${events.length} full-window highs over ${count} aligned ${benchmark} sessions` };
+  }
+
+  /* lightweight-charts accepts three time types. Normalise them all to "YYYY-MM-DD"
+     rather than stringifying an object into "[object Object]". */
+  function normalizeTime(time) {
+    if (time === null || time === undefined) return null;
+    if (typeof time === "number" && Number.isFinite(time)) {
+      const stamp = new Date(Math.abs(time) < 1e11 ? time * 1000 : time);
+      return Number.isNaN(stamp.getTime()) ? null : stamp.toISOString().slice(0, 10);
+    }
+    if (typeof time === "object") {
+      const year = Number(time.year);
+      const month = Number(time.month);
+      const day = Number(time.day);
+      if (![year, month, day].every((value) => Number.isFinite(value))) return null;
+      return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    }
+    const day = String(time).slice(0, 10);
+    return /^\d{4}-\d{2}-\d{2}$/.test(day) ? day : null;
+  }
+
+  /* Map RS events onto the bars actually displayed. Documented semantics: a weekly or
+     monthly RS marker means at least one session in that period closed the RS line at a
+     252-session high; `count` says how many. */
+  function eventMarkers(events, bars, timeframe) {
+    const list = Array.isArray(events) ? events : (events && events.events) || [];
+    const rows = Array.isArray(bars) ? bars : [];
+    if (!list.length || !rows.length) return [];
+    const keyOf = timeframe === "W" ? isoWeekKey : timeframe === "M" ? monthKey : (day) => String(day);
+    const periods = new Map();
+    for (const bar of rows) periods.set(keyOf(String(bar[0])), String(bar[0]));
+    const counts = new Map();
+    for (const event of list) {
+      const date = normalizeTime(event && event.date);
+      if (!date) continue;
+      const time = periods.get(keyOf(date));
+      if (!time) continue;
+      counts.set(time, (counts.get(time) || 0) + 1);
+    }
+    return [...counts.entries()]
+      .map(([time, count]) => ({ time, position: "belowBar", shape: "circle", color: "#2ee6a8",
+        size: 0.6, kind: "rs_event", count }))
+      .sort((left, right) => (left.time < right.time ? -1 : left.time > right.time ? 1 : 0));
+  }
+
+  const MARKER_PRIORITY = { leg: 0, rs_event: 1, rs_latest: 2 };
+
+  function markerPriority(marker) {
+    const kind = marker && marker.kind;
+    return Object.prototype.hasOwnProperty.call(MARKER_PRIORITY, kind) ? MARKER_PRIORITY[kind] : 3;
+  }
+
+  /* Merge marker groups into the one array lightweight-charts requires: normalised
+     times, stable-sorted ascending, same-time markers ordered by kind. Throws rather
+     than silently dropping a marker whose time cannot be read. */
+  function sortedMarkers(...groups) {
+    const flat = [];
+    for (const group of groups) {
+      for (const marker of group || []) {
+        const time = normalizeTime(marker && marker.time);
+        if (!time) throw new Error(`marker without a valid date: ${JSON.stringify(marker) || marker}`);
+        flat.push({ ...marker, time });
+      }
+    }
+    return flat
+      .map((marker, order) => ({ marker, order }))
+      .sort((left, right) => (left.marker.time < right.marker.time ? -1
+        : left.marker.time > right.marker.time ? 1
+        : markerPriority(left.marker) - markerPriority(right.marker) || left.order - right.order))
+      .map((entry) => entry.marker);
+  }
+
+  /* The guard that runs immediately before every setMarkers call. */
+  function assertSortedMarkers(markers) {
+    let previous = null;
+    for (const marker of markers || []) {
+      const time = normalizeTime(marker && marker.time);
+      if (!time) throw new Error("marker without a valid date");
+      if (previous !== null && time < previous) {
+        throw new Error(`marker times are not ascending: ${time} follows ${previous}`);
+      }
+      previous = time;
+    }
+    return markers || [];
   }
 
   function volumeSeries(bars, period = 50) {
@@ -113,11 +255,78 @@ const MSChart = (() => {
     }));
   }
 
-  function priceLabels(bars) {
+  /* The extrema of whatever bars are on screen. Useful as a caption, never as a
+     named level: it changes with the timeframe and the zoom, so it is deliberately
+     not drawn as a price line. The named 52-week levels come from ``referenceModel``. */
+  function loadedRange(bars) {
     const highs = (bars || []).map((bar) => numeric(bar[2])).filter((value) => value !== null);
     const lows = (bars || []).map((bar) => numeric(bar[3])).filter((value) => value !== null);
-    if (!highs.length || !lows.length) return { high: null, low: null };
-    return { high: Math.max(...highs), low: Math.min(...lows) };
+    if (!highs.length || !lows.length) return { high: null, low: null, bars: (bars || []).length };
+    return { high: Math.max(...highs), low: Math.min(...lows), bars: bars.length };
+  }
+
+  /* The one dated 52-week reference published with the series (SPEC-AG §2.2).
+     Every renderer reads this object; nothing recomputes a "52-week" level from the
+     bars that happen to be loaded. */
+  function referenceModel(reference) {
+    const source = reference && typeof reference === "object" ? reference : null;
+    const high = source ? numeric(source.high) : null;
+    const low = source ? numeric(source.low) : null;
+    const observations = source ? numeric(source.observations) : null;
+    const expected = source ? numeric(source.expected_observations) : null;
+    const status = source ? String(source.status || "unavailable") : "unavailable";
+    const available = status !== "unavailable" && high !== null && low !== null;
+    const short = status === "insufficient_history" && observations !== null && expected !== null;
+    const suffix = short ? ` · ${observations}/${expected} sessions` : "";
+    const startDate = source && source.start_date ? String(source.start_date) : null;
+    const endDate = source && source.end_date ? String(source.end_date) : null;
+    const window = startDate && endDate ? `${startDate} → ${endDate}` : null;
+    return {
+      available, status, high, low, observations, expected, startDate, endDate, window,
+      asOf: source && source.as_of ? String(source.as_of) : null,
+      definition: source && source.definition ? String(source.definition) : null,
+      inputHash: source && source.input_hash ? String(source.input_hash) : null,
+      highTitle: `52w high${suffix}`,
+      lowTitle: `52w low${suffix}`,
+      note: available
+        ? `52-week reference (${status === "complete" ? "complete" : "short history"}): `
+          + `${observations === null ? "?" : observations} of ${expected === null ? "?" : expected} `
+          + `sessions${window ? `, ${window}` : ""}`
+        : "52-week reference unavailable",
+    };
+  }
+
+  /* True when the newest aggregated bar's period has not closed yet at ``asOf``:
+     a weekly bar before Friday, or a monthly bar before the month's last day. Display
+     only — no signal reads it. */
+  function partialLast(bars, timeframe, asOf) {
+    if (!Array.isArray(bars) || !bars.length) return false;
+    if (timeframe !== "W" && timeframe !== "M") return false;
+    const periods = aggregate(bars, timeframe);
+    if (!periods.length) return false;
+    const last = String(periods[periods.length - 1][0]);
+    const keyOf = timeframe === "W" ? isoWeekKey : monthKey;
+    const reference = asOf ? String(asOf).slice(0, 10) : last;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(reference)) return false;
+    // A later period means this one is closed, however few sessions it holds.
+    if (keyOf(reference) !== keyOf(last)) return false;
+    if (timeframe === "W") {
+      const weekday = new Date(`${reference}T00:00:00Z`).getUTCDay() || 7;
+      return weekday < 5;
+    }
+    const year = Number(reference.slice(0, 4));
+    const month = Number(reference.slice(5, 7));
+    const lastDay = new Date(Date.UTC(year, month, 0)).getUTCDate();
+    return Number(reference.slice(8, 10)) < lastDay;
+  }
+
+  function partialLastNote(bars, timeframe, asOf) {
+    if (!partialLast(bars, timeframe, asOf)) return null;
+    const periods = aggregate(bars, timeframe);
+    const last = String(periods[periods.length - 1][0]);
+    return timeframe === "W"
+      ? `last weekly bar is partial (week of ${isoWeekKey(last)}, through ${last})`
+      : `last monthly bar is partial (${monthKey(last)}, through ${last})`;
   }
 
   /* ── drawings ─────────────────────────────────────────────────────────────
@@ -236,19 +445,41 @@ const MSChart = (() => {
       .map((entry) => createDrawing(entry.tool, entry.points || [], entry));
   }
 
-  /* ── list context and keyboard ────────────────────────────────────────── */
+  /* ── list context and keyboard ──────────────────────────────────────────
+     Version 2 (SPEC-AG §4.4): the context carries the *displayed* order, the sort that
+     produced it, the build it belongs to, the route each member resolves to and the
+     members this snapshot does not carry. Every link producer reads this one object, so
+     sorting a list and walking it with the keyboard cannot disagree. */
+  const LIST_CONTEXT_VERSION = 2;
+
+  function listSort(sort) {
+    return sort && sort.key
+      ? { key: String(sort.key), direction: sort.direction === "asc" ? "asc" : "desc" }
+      : null;
+  }
+
   function listContext(definition, symbol) {
-    const symbols = (definition && definition.symbols) || [];
-    const requested = Number.isInteger(definition && definition.index) ? definition.index : -1;
+    const source = definition || {};
+    const symbols = (source.symbols || []).map((entry) => String(entry));
+    const requested = Number.isInteger(source.index) ? source.index : -1;
     const found = symbols.indexOf(String(symbol || "").toUpperCase());
     const index = found !== -1 ? found : requested >= 0 && requested < symbols.length ? requested : -1;
+    const unresolved = (source.unresolved || []).map((entry) => String(entry));
     return {
-      id: (definition && definition.id) || null,
-      title: (definition && definition.title) || null,
+      version: LIST_CONTEXT_VERSION,
+      id: source.id || null,
+      title: source.title || null,
+      build_id: source.build_id || null,
       symbols,
       index,
       position: index === -1 ? null : `${index + 1} of ${symbols.length}`,
-      fallback: Boolean(definition && definition.fallback),
+      sort: listSort(source.sort),
+      pages: source.pages || null,
+      unresolved,
+      unresolvedNote: unresolved.length
+        ? `${unresolved.length} of ${symbols.length + unresolved.length} list members are not in this snapshot`
+        : null,
+      fallback: Boolean(source.fallback),
     };
   }
 
@@ -355,10 +586,12 @@ const MSChart = (() => {
 
   return {
     contractVersion: MSCHART_CONTRACT_VERSION, DRAW_TOOLS, TIMEFRAMES, MA_PERIODS, RS_LOOKBACK,
-    isoWeekKey, monthKey, aggregate, movingAverage, rsLine, volumeSeries, priceLabels,
+    isoWeekKey, monthKey, aggregate, movingAverage, rsLine, volumeSeries,
+    loadedRange, referenceModel, partialLast, partialLastNote,
+    fnv1a12, rsEvents, normalizeTime, eventMarkers, sortedMarkers, assertSortedMarkers,
     createDrawing, snapToClose, project, hitTest, moveDrawing, distanceToSegment,
     storageKey, loadDrawings, saveDrawings, exportDrawings, importDrawings,
-    listContext, advance, keyAction, panelModel, panelValue,
+    LIST_CONTEXT_VERSION, listSort, listContext, advance, keyAction, panelModel, panelValue,
   };
 })();
 if (typeof module !== "undefined" && module.exports) module.exports = MSChart;
