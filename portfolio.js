@@ -8,7 +8,7 @@
  */
 "use strict";
 const Portfolio = (() => {
-  const PORTFOLIO_CONTRACT_VERSION = "portfolio-contract-1.0";
+  const PORTFOLIO_CONTRACT_VERSION = "portfolio-contract-1.1";
   const GRADE_BANDS = [["A", 85], ["B", 70], ["C", 55], ["D", 40], ["E", 0]];
   // Weights of the per-stock score; renormalised over the components a row has.
   const STOCK_WEIGHTS = { composite: 0.55, stage: 0.20, readiness: 0.15, sell: 0.10 };
@@ -34,6 +34,35 @@ const Portfolio = (() => {
     eps_growth_rate: "SEPA EPS growth rate",
     earnings_stability: "SEPA earnings stability",
   };
+  /* ── lot policy (SPEC-AI §1) ───────────────────────────────────────────────
+     Every submitted line is an immutable lot with its own validation result, and a
+     position is what its *valid* lots say it is:
+
+       · ``aggregate_average_cost`` is published only when EVERY valid share carries a
+         compatible cost. A subset never stands in for the whole; ``known_cost`` is
+         always published with the quantity it covers, and a known-lot P&L is scoped to
+         those shares, never presented as the position's gain.
+       · cost coverage (complete / partial / missing / invalid) and valuation coverage
+         are independent: the whole quantity can be valued at the snapshot close while
+         P&L stays unknown.
+       · cost-dependent outputs — ``cost``, ``gain_pct``, ``gain_value`` and the 8 %
+         loss rule — are null/unknown unless cost coverage is complete. Unknown is never
+         reported as clear.
+       · an invalid lot (missing, zero, negative, non-finite or non-numeric quantity; a
+         negative, zero or non-numeric price) is never dropped because another lot is
+         valid: it is listed with its line number and its reason, and the quantity it
+         would have added is reported as unknown rather than as smaller exposure.
+       · recorded stops: the position stop is the HIGHEST recorded stop among the valid
+         lots (the most conservative for a long); a disagreement is printed, a stop
+         missing on some lots is not a disagreement.
+       · input order never changes a number here: every sum is order-independent and
+         ``lot_id`` only fixes the display order. */
+  const LOT_POLICY = "Cost policy: an average cost is published only when every valid "
+    + "share carries a cost; a partly costed position reports its known cost, the "
+    + "quantity that cost covers, and an unknown P&L (the 8 % loss rule reads unknown, "
+    + "never clear). Invalid lots are listed with their line number, never dropped, and "
+    + "the exposure they would add is unknown rather than smaller.";
+  const COVERAGE_STATES = ["complete", "partial", "missing", "invalid"];
   const finite = (value) => typeof value === "number" && Number.isFinite(value);
   const number = (value) => {
     if (value === null || value === undefined || value === "") return null;
@@ -79,6 +108,20 @@ const Portfolio = (() => {
     return finite(cost) && cost > 0 && finite(close) ? ((close - cost) / cost) * 100 : null;
   }
 
+  /* Why the 8 %-loss rule cannot be answered: no cost at all, or only part of the
+     position costed — in which case the known-lot P&L is named as such. */
+  function lossRuleReason(item, close) {
+    const basis = (item || {}).basis;
+    if (!basis || basis.cost_coverage === "missing" || basis.cost_coverage === "invalid") {
+      return "no average price on this position";
+    }
+    const known = basis.known_average_cost;
+    const scoped = finite(known) && known > 0 && finite(close)
+      ? `; known-lot P&L ${(((close - known) / known) * 100).toFixed(1)} %` : "";
+    return `cost basis incomplete — ${basis.cost_known_quantity} of ${basis.valid_quantity} `
+      + `shares carry a cost${scoped}`;
+  }
+
   /* Every rule is three-valued: true (breached), false (clear) or null (the input is
      not in this snapshot). A missing input is never reported as a clear rule. */
   function sellRules(item, row) {
@@ -97,8 +140,10 @@ const Portfolio = (() => {
         detail: stop === null ? "no stop recorded with the position and no active pattern stop"
           : `close ₹${close} vs stop ₹${stop} (${source})` },
       { id: "loss8", label: "Loss of 8 % or more from the average price",
+        // Cost-dependent: while some shares carry no cost the rule stays unknown. The
+        // known-lot figure is shown beside it, scoped to the shares it covers.
         state: gain === null ? null : gain <= STOP_LOSS_PCT,
-        detail: gain === null ? "no average price on this position" : `${gain.toFixed(1)} % vs entry` },
+        detail: gain === null ? lossRuleReason(item, close) : `${gain.toFixed(1)} % vs entry` },
       { id: "climax", label: "Climax run",
         state: base.climax_run === undefined && !(row || {}).power_play ? null : climax,
         detail: climax ? "a climax run is flagged on this base" : "no climax run flagged" },
@@ -139,6 +184,10 @@ const Portfolio = (() => {
     const cost = number(item.avg_price);
     const gain = gainPct(item, row);
     const decision = sellRules(item, row);
+    // A card built straight from one submitted line still gets a basis, so every
+    // renderer reads cost coverage from one place.
+    const basis = item.basis || positionBasis(validateLots([item]));
+    const knownAverage = basis.known_average_cost;
     return {
       symbol: item.symbol, name: (row || {}).name || item.symbol, missing: !row,
       close, chg_pct: (row || {}).chg_pct ?? null,
@@ -147,6 +196,23 @@ const Portfolio = (() => {
       cost: finite(qty) && finite(cost) ? qty * cost : null,
       gain_pct: gain,
       gain_value: finite(qty) && finite(close) && finite(cost) ? qty * (close - cost) : null,
+      // Lot-level truth (SPEC-AI §1): what is valid, what is costed, what is unknown.
+      lots: basis.lots.length,
+      valid_quantity: basis.valid_quantity,
+      cost_known_quantity: basis.cost_known_quantity,
+      known_cost: basis.known_cost,
+      known_average_cost: knownAverage,
+      aggregate_average_cost: basis.aggregate_average_cost,
+      cost_coverage: basis.cost_coverage,
+      valuation_coverage: finite(close) ? basis.valuation_coverage
+        : basis.valid_quantity > 0 ? "missing" : "invalid",
+      // Scoped to the costed shares only — never the position's gain.
+      known_lots_gain_pct: finite(knownAverage) && knownAverage > 0 && finite(close)
+        ? ((close - knownAverage) / knownAverage) * 100 : null,
+      known_lots_gain_value: finite(knownAverage) && finite(close)
+        ? basis.cost_known_quantity * (close - knownAverage) : null,
+      lot_errors: basis.errors,
+      stop_policy: basis.stop_policy,
       buy_range: buyRange(item),
       addition_date: item.entry_date || (item.added_at ? String(item.added_at).slice(0, 10) : null),
       ratings: { composite: ratingsOf(row).composite ?? null, rs: ratingsOf(row).rs ?? null,
@@ -165,9 +231,12 @@ const Portfolio = (() => {
     };
   }
 
+  /* One card per symbol: two lots of one stock are one position, and the card carries
+     the lot-level coverage rather than a merged number nobody submitted. */
   function currentHoldings(holdings, rows) {
     const byId = rows instanceof Map ? rows : index(rows);
-    return (holdings || []).map((item) => holdingCard(item, byId.get(String(item.symbol)) || null));
+    return mergeHoldings(holdings)
+      .map((item) => holdingCard(item, byId.get(String(item.symbol)) || null));
   }
 
   function sellWatchlist(holdings, rows) {
@@ -304,40 +373,140 @@ const Portfolio = (() => {
     return `quantity ${parsed} is not greater than zero`;
   }
 
-  /* Two lots of one symbol are one position: quantities add, the cost basis is
-     quantity-weighted over the lots that carry both, and the entry date is the earliest. */
-  function mergeHoldings(holdings) {
-    const order = [];
-    const groups = new Map();
-    for (const entry of holdings || []) {
+  function priceReason(value) {
+    if (value === null || value === undefined || value === "") return null;  // no cost recorded
+    const parsed = number(value);
+    if (!finite(parsed)) return `average price ${JSON.stringify(String(value))} is not a number`;
+    if (parsed === 0) return "average price is zero";
+    if (parsed < 0) return `average price ${parsed} is not greater than zero`;
+    return null;
+  }
+
+  /* Step 1: every submitted line becomes an immutable lot carrying what was submitted
+     and what is wrong with it. Nothing is dropped and nothing is repaired here. */
+  function validateLots(holdings) {
+    return (holdings || []).map((entry, position) => {
       const item = entry || {};
       const symbol = String(item.symbol || "").toUpperCase();
-      if (!groups.has(symbol)) { groups.set(symbol, []); order.push(symbol); }
-      groups.get(symbol).push(item);
-    }
-    return order.map((symbol) => {
-      const lots = groups.get(symbol);
-      const quantities = lots.map((lot) => number(lot.qty));
-      const usable = quantities.filter((value) => finite(value) && value > 0);
-      const qty = usable.length ? usable.reduce((total, value) => total + value, 0)
-        : lots.length === 1 ? lots[0].qty : null;
-      let costValue = 0;
-      let costQty = 0;
-      lots.forEach((lot, position) => {
-        const price = number(lot.avg_price);
-        const quantity = quantities[position];
-        if (finite(price) && price > 0 && finite(quantity) && quantity > 0) {
-          costValue += price * quantity;
-          costQty += quantity;
-        }
-      });
-      const avg_price = costQty > 0 ? costValue / costQty
-        : lots.length === 1 ? lots[0].avg_price : null;
-      const dates = lots
-        .map((lot) => lot.entry_date || (lot.added_at ? String(lot.added_at).slice(0, 10) : null))
-        .filter(Boolean).sort();
-      return { ...lots[0], symbol, qty, avg_price, entry_date: dates[0] || null, lots: lots.length };
+      const qty = number(item.qty);
+      const price = number(item.avg_price);
+      const errors = [];
+      if (!(finite(qty) && qty > 0)) errors.push(quantityReason(item.qty));
+      const priceError = priceReason(item.avg_price);
+      if (priceError) errors.push(priceError);
+      const entryDate = item.entry_date
+        || (item.added_at ? String(item.added_at).slice(0, 10) : null) || null;
+      return {
+        lot_id: position + 1,
+        line: finite(number(item.line)) ? number(item.line) : null,
+        symbol,
+        qty: finite(qty) ? qty : null,
+        avg_price: finite(price) ? price : null,
+        entry_date: entryDate,
+        entry_stop: item.entry_stop ?? null,
+        entry_pivot: item.entry_pivot ?? null,
+        entry_buy_high: item.entry_buy_high ?? null,
+        note: item.note ?? null,
+        original: { qty: item.qty ?? null, avg_price: item.avg_price ?? null,
+          entry_date: item.entry_date ?? null },
+        errors,
+      };
     });
+  }
+
+  /* Step 2: one position per symbol, built from its valid lots. The invalid ones stay
+     attached so the card can name them; they never silently reduce the position. */
+  function positionBasis(lots) {
+    const all = lots || [];
+    const symbol = String((all[0] || {}).symbol || "").toUpperCase();
+    const valid = all.filter((lot) => lot.errors.length === 0);
+    const invalid = all.filter((lot) => lot.errors.length > 0);
+    const validQuantity = valid.reduce((total, lot) => total + lot.qty, 0);
+    const costed = valid.filter((lot) => finite(lot.avg_price) && lot.avg_price > 0);
+    const costKnownQuantity = costed.reduce((total, lot) => total + lot.qty, 0);
+    const knownCost = costed.reduce((total, lot) => total + lot.qty * lot.avg_price, 0);
+    // A subset of costed shares never stands in for the whole position.
+    const complete = validQuantity > 0 && costKnownQuantity === validQuantity;
+    const costCoverage = validQuantity <= 0 ? "invalid"
+      : complete ? "complete" : costKnownQuantity > 0 ? "partial" : "missing";
+    const valuationCoverage = validQuantity <= 0 ? "invalid"
+      : invalid.length ? "partial" : "complete";
+    const dates = valid.map((lot) => lot.entry_date).filter(Boolean).sort();
+    const stops = [...new Set(valid.map((lot) => number(lot.entry_stop))
+      .filter((value) => finite(value)))].sort((a, b) => a - b);
+    // The tightest recorded stop is the highest one: for a long it is the earliest exit.
+    const stop = stops.length ? stops[stops.length - 1] : null;
+    return {
+      symbol,
+      lots: all, valid_lots: valid, invalid_lots: invalid,
+      valid_quantity: validQuantity,
+      cost_known_quantity: costKnownQuantity,
+      known_cost: costKnownQuantity > 0 ? knownCost : null,
+      known_average_cost: costKnownQuantity > 0 ? knownCost / costKnownQuantity : null,
+      aggregate_average_cost: complete ? knownCost / validQuantity : null,
+      cost_coverage: costCoverage,
+      valuation_coverage: valuationCoverage,
+      entry_date: dates[0] || null,
+      stop_policy: {
+        stop,
+        source: stop === null ? null : "the stop recorded with the position",
+        conflict: stops.length > 1 ? stops : null,
+      },
+      errors: all.flatMap((lot) => lot.errors.map((reason) => ({ line: lot.line,
+        lot_id: lot.lot_id, reason }))),
+    };
+  }
+
+  /* The three sentences a partly costed position needs, in one place so the holdings
+     table, the evaluation card and the local app say exactly the same thing. */
+  function coverageText(card) {
+    const valid = finite(card.valid_quantity) ? card.valid_quantity : 0;
+    const known = finite(card.cost_known_quantity) ? card.cost_known_quantity : 0;
+    const missing = Math.max(0, valid - known);
+    const state = card.cost_coverage;
+    return {
+      cost: state === "invalid" ? "no valid quantity" : `cost-known ${known} of ${valid} sh`,
+      average: state === "complete" ? null
+        : state === "invalid" ? "n/a — no valid quantity on this position"
+          : `n/a — ${missing} of ${valid} shares have no cost`,
+      pnl: state === "complete" ? null : "unknown — cost basis incomplete",
+    };
+  }
+
+  /* One position per symbol, in the order the symbols were submitted. */
+  function positions(holdings) {
+    const order = [];
+    const groups = new Map();
+    for (const lot of validateLots(holdings)) {
+      if (!groups.has(lot.symbol)) { groups.set(lot.symbol, []); order.push(lot.symbol); }
+      groups.get(lot.symbol).push(lot);
+    }
+    return order.map((symbol) => positionBasis(groups.get(symbol)));
+  }
+
+  /* The flat "item" view the cards and sell rules read, built from the basis. A cost is
+     only carried when every valid share has one; ``basis`` travels with it so a renderer
+     can print the coverage instead of a number that was never known. */
+  function itemFor(basis) {
+    const first = basis.valid_lots[0] || basis.lots[0] || {};
+    return {
+      symbol: basis.symbol,
+      qty: basis.valid_quantity > 0 ? basis.valid_quantity : null,
+      avg_price: basis.aggregate_average_cost,
+      entry_date: basis.entry_date,
+      entry_stop: basis.stop_policy.stop,
+      entry_pivot: first.entry_pivot ?? null,
+      entry_buy_high: first.entry_buy_high ?? null,
+      note: first.note ?? null,
+      lots: basis.lots.length,
+      basis,
+    };
+  }
+
+  /* Kept for callers that only want the merged view; it is now the basis model's
+     projection, so a partly costed position carries no invented average cost. */
+  function mergeHoldings(holdings) {
+    return positions(holdings).map(itemFor);
   }
 
   function evaluate(holdings, rows, options = {}) {
@@ -347,6 +516,7 @@ const Portfolio = (() => {
     const unresolved = [];
     const cards = items.map((item) => {
       const row = byId.get(String(item.symbol)) || null;
+      const basis = item.basis;
       const matched = Boolean(row);
       const quantity = number(item.qty);
       const validQuantity = finite(quantity) && quantity > 0;
@@ -360,12 +530,18 @@ const Portfolio = (() => {
       const rulesKnown = card.sell.rules.some((rule) => rule.state === true || rule.state === false);
       const scorable = valued && finite(scored.score);
       const reason = !matched ? "no row for this symbol in this snapshot"
-        : !validQuantity ? quantityReason(item.qty)
+        : !validQuantity ? (basis.errors[0] || {}).reason || quantityReason(item.qty)
         : !priced ? "this snapshot carries no close for the symbol"
         : stale ? `the close is stale (last data ${(row || {}).last_date || "unknown"})`
         : !finite(scored.score) ? (scored.reason || "no rated input to score this row")
         : null;
-      if (reason) unresolved.push({ symbol: item.symbol, reason });
+      if (reason) unresolved.push({ symbol: item.symbol, line: null, kind: "position", reason });
+      // An invalid lot is reported even when the position itself resolves: it never
+      // disappears because another lot of the same symbol was valid.
+      for (const error of basis.errors) {
+        unresolved.push({ symbol: item.symbol, line: error.line, kind: "lot",
+          reason: error.reason });
+      }
       return {
         ...card,
         lots: item.lots || 1,
@@ -378,7 +554,9 @@ const Portfolio = (() => {
         lifecycle_state: baseOf(row).lifecycle_state || qualificationOf(row).lifecycle_state || null,
         entry_state: qualificationOf(row).entry_state || null,
         coverage: { matched, valid_quantity: validQuantity, priced, valued,
-          stale_priced: stalePriced, scorable, rules_known: rulesKnown },
+          stale_priced: stalePriced, scorable, rules_known: rulesKnown,
+          cost: card.cost_coverage, valuation: card.valuation_coverage,
+          lots_invalid: basis.invalid_lots.length },
         unresolved_reason: reason,
         action: action(card, scored),
       };
@@ -397,6 +575,13 @@ const Portfolio = (() => {
       stale_priced: cards.filter((card) => card.coverage.stale_priced).length,
       scorable: scorableCards.length,
       rules_known: cards.filter((card) => card.coverage.rules_known).length,
+      // Cost coverage is counted separately from valuation: a fully valued position can
+      // still have an unknown P&L (SPEC-AI §1).
+      cost_known: cards.filter((card) => card.coverage.cost === "complete").length,
+      cost_partial: cards.filter((card) => card.coverage.cost === "partial").length,
+      cost_missing: cards.filter((card) => card.coverage.cost === "missing").length,
+      lots_submitted: cards.reduce((total, card) => total + card.lots, 0),
+      lots_invalid: cards.reduce((total, card) => total + card.coverage.lots_invalid, 0),
       unresolved,
       valued_share: valuedTotal > 0 && scorableValue > 0 ? (scorableValue / valuedTotal) * 100 : null,
     };
@@ -410,13 +595,21 @@ const Portfolio = (() => {
     const subsetRequested = options.subset === true;
     const allValued = valuedCards.length > 0
       && valuedCards.length === (subsetRequested ? valuedCards.length : submitted);
-    const concentrationScore = allValued ? spread.score : null;
+    // An invalid lot leaves the position's true size unknown, so total exposure is
+    // unknown too — never quietly smaller (SPEC-AI §1).
+    const partialExposure = (subsetRequested ? valuedCards : cards)
+      .filter((card) => card.coverage.valuation === "partial");
+    const exposureKnown = allValued && partialExposure.length === 0;
+    const concentrationScore = exposureKnown ? spread.score : null;
     const concentrationReason = !allValued
       ? `${submitted - valuedCards.length} of ${submitted} positions have no usable price, `
         + "so total exposure is unknown"
-      : valuedCards.length < submitted
-        ? `computed over the ${valuedCards.length} valued positions only`
-        : spread.reason;
+      : partialExposure.length
+        ? `${partialExposure.length} position(s) carry an invalid lot `
+          + `(${partialExposure.map((card) => card.symbol).join(", ")}), so total exposure is unknown`
+        : valuedCards.length < submitted
+          ? `computed over the ${valuedCards.length} valued positions only`
+          : spread.reason;
     const ruleCards = valuedCards.filter((card) => card.coverage.rules_known);
     const ruleTotal = ruleCards.reduce((total, card) => total + card.value, 0);
     const breachedValue = ruleCards.filter((card) => card.sell.triggered.length)
@@ -511,12 +704,20 @@ const Portfolio = (() => {
       };
       const symbol = String(at(["symbol", "ticker"], 0) || "").toUpperCase().replace(/[^A-Z0-9&._-]/g, "");
       if (!symbol) { errors.push({ line: position + 1, text: cells.join(","), reason: "no symbol" }); continue; }
-      const item = { symbol };
-      const qty = number(at(["qty", "quantity", "shares"], 1));
-      const price = number(at(["avg", "price", "cost"], 2));
+      // The line number travels with the lot: an invalid cell is reported where it was
+      // typed, not as an anonymous position (SPEC-AI §1).
+      const item = { symbol, line: position + 1 };
+      const rawQty = at(["qty", "quantity", "shares"], 1);
+      const rawPrice = at(["avg", "price", "cost"], 2);
+      const qty = number(rawQty);
+      const price = number(rawPrice);
       const date = String(at(["date", "entry"], 3) || "").slice(0, 10);
-      if (qty !== null) item.qty = qty;
-      if (price !== null) item.avg_price = price;
+      // A cell that is present but unreadable is passed through as submitted so the
+      // lot validator can name it; a blank price cell stays null (cost unknown).
+      item.qty = qty !== null ? qty : (rawQty === undefined || String(rawQty ?? "").trim() === ""
+        ? null : rawQty);
+      item.avg_price = price !== null ? price
+        : (rawPrice === undefined || String(rawPrice ?? "").trim() === "" ? null : rawPrice);
       if (/^\d{4}-\d{2}-\d{2}$/.test(date)) item.entry_date = date;
       items.push(item);
     }
@@ -563,6 +764,46 @@ const Portfolio = (() => {
       return `${fmt(value, 0)}${(ratings || {}).composite_basis === "partial" ? " P" : ""}`;
     }
 
+    /* Cost cells never show a number the reader did not supply: an incomplete basis
+       reads "n/a — 10 of 20 shares have no cost" and its P&L reads unknown. */
+    function costCell(card) {
+      const text = coverageText(card);
+      if (card.cost_coverage === "complete") {
+        return `${money(card.avg_price)}<small class="muted"> ${esc(text.cost)}</small>`;
+      }
+      return `<span class="muted">${esc(text.average)}</span>`
+        + (finite(card.known_cost)
+          ? `<small class="muted"> known cost ${money(card.known_cost)} · ${esc(text.cost)}</small>`
+          : "");
+    }
+
+    function gainCell(card) {
+      if (card.cost_coverage === "complete") {
+        return `<span class="${esc(cls(card.gain_pct))}">${esc(signed(card.gain_pct))}</span>`;
+      }
+      // Scoped, and deliberately unsigned: a "+x %" beside a position is read as the
+      // position's gain, which is exactly the claim this build must not make.
+      const scoped = finite(card.known_lots_gain_pct)
+        ? `<small class="muted"> known lots only (${card.cost_known_quantity} of `
+          + `${card.valid_quantity} sh): ${fmt(card.known_lots_gain_pct, 1)} % vs their own cost`
+          + "</small>" : "";
+      return `<span class="muted">${esc(coverageText(card).pnl)}</span>${scoped}`;
+    }
+
+    /* Every lot error, with the line it came from — never dropped because another lot
+       of the same symbol was valid. */
+    function lotErrorsHtml(card) {
+      return (card.lot_errors || []).map((error) => `<li class="negative">${esc(error.line === null
+        ? `lot ${error.lot_id}` : `line ${error.line}`)}: ${esc(error.reason)}</li>`).join("");
+    }
+
+    function stopNote(card) {
+      const policy = card.stop_policy || {};
+      if (!policy.conflict) return "";
+      return `lots record different stops; the tightest (₹${fmt(policy.stop, 2)}) is used `
+        + `(${policy.conflict.map((value) => `₹${fmt(value, 2)}`).join(", ")})`;
+    }
+
     function holdingsTable(cards) {
       if (!cards.length) {
         return `<p class="list-empty">No positions yet. Open a stock page and use "Record position…", `
@@ -570,17 +811,21 @@ const Portfolio = (() => {
       }
       const rows = cards.map((card) => `<tr><td>${link(card.symbol)}</td><td>${esc(card.name)}</td>
         <td>${money(card.close)}</td><td class="${esc(cls(card.chg_pct))}">${esc(signed(card.chg_pct))}</td>
-        <td>${fmt(card.qty, 0)}</td><td>${money(card.avg_price)}</td>
-        <td class="${esc(cls(card.gain_pct))}">${esc(signed(card.gain_pct))}</td>
+        <td>${fmt(card.qty, 0)}${card.lots > 1 ? `<small class="muted"> ${card.lots} lots</small>` : ""}</td>
+        <td>${costCell(card)}</td>
+        <td>${gainCell(card)}</td>
         <td>${esc(card.buy_range.text)}${card.buy_range.reason
           ? `<small class="muted"> ${esc(card.buy_range.reason)}</small>` : ""}</td>
         <td>${esc(card.addition_date || "–")}</td>
         <td title="P = partial input set">${esc(compositeText(card.ratings))}/${fmt(card.ratings.rs, 0)}/${fmt(card.ratings.eps, 0)}/${esc(card.ratings.ad || "–")}</td>
-        <td>${esc(card.eps_due)}</td><td>${sellCell(card)}</td></tr>`).join("");
+        <td>${esc(card.eps_due)}</td><td>${sellCell(card)}${(card.lot_errors || []).length
+          ? `<ul class="lot-errors">${lotErrorsHtml(card)}</ul>` : ""}${stopNote(card)
+            ? `<small class="muted">${esc(stopNote(card))}</small>` : ""}</td></tr>`).join("");
       return `<div class="detail-table-wrap"><table class="detail-table"><thead><tr>
         <th>Symbol</th><th>Name</th><th>CMP</th><th>1D %</th><th>Qty</th><th>Avg price</th><th>Gain %</th>
         <th>Buy range at entry</th><th>Added</th><th>Comp/RS/EPS/AD</th><th>EPS due</th><th>Sell rules</th>
-        </tr></thead><tbody>${rows}</tbody></table></div>`;
+        </tr></thead><tbody>${rows}</tbody></table></div>
+        <p class="fineprint">${esc(LOT_POLICY)}</p>`;
     }
 
     function buyWatchlistTable(entries) {
@@ -612,21 +857,31 @@ const Portfolio = (() => {
       const policy = "Policy: a position counts only when this snapshot carries a row, a "
         + "quantity above zero and a fresh close. Unknown is neither failed nor clear, an "
         + "unpriced position makes total exposure unknown, and a grade needs at least two "
-        + "components.";
+        + `components. ${LOT_POLICY}`;
       const counts = `Coverage: ${coverage.submitted} submitted · ${coverage.matched} matched · `
         + `${coverage.valid_quantity} with a usable quantity · ${coverage.valued} valued · `
         + `${coverage.stale_priced} stale-priced · ${coverage.scorable} scorable · `
-        + `${coverage.rules_known} with a known sell rule.`;
-      const list = unresolved.map((entry) => `${entry.symbol} (${entry.reason})`).join(", ");
-      const resolved = coverage.submitted - unresolved.length;
+        + `${coverage.rules_known} with a known sell rule · `
+        + `${coverage.cost_known} fully costed · ${coverage.cost_partial} partly costed · `
+        + `${coverage.lots_invalid} invalid lot(s) of ${coverage.lots_submitted}.`;
+      // Position-level problems drive the withheld grade; lot-level ones are listed too,
+      // with the line they came from, and never disappear beside a valid lot.
+      const positionErrors = unresolved.filter((entry) => entry.kind !== "lot");
+      const lotErrors = unresolved.filter((entry) => entry.kind === "lot");
+      const list = positionErrors.map((entry) => `${entry.symbol} (${entry.reason})`).join(", ");
+      const lotList = lotErrors.map((entry) => `${entry.symbol} ${entry.line === null
+        ? "" : `line ${entry.line}`}: ${entry.reason}`).join(" · ");
+      const resolved = coverage.submitted - positionErrors.length;
+      const lotBanner = lotErrors.length
+        ? `<p class="fineprint negative">Lot errors (${lotErrors.length}): ${esc(lotList)}</p>` : "";
       const banner = result.status === "insufficient_data"
         ? `<div class="evaluation-banner negative"><b>Cannot evaluate</b>
             <p>${esc(result.reason || "nothing in this input could be scored against this snapshot.")}</p>
-            ${unresolved.length ? `<p class="fineprint">${esc(list)}</p>` : ""}</div>`
+            ${positionErrors.length ? `<p class="fineprint">${esc(list)}</p>` : ""}${lotBanner}</div>`
         : result.status === "partial"
           ? `<div class="evaluation-banner negative"><b>Portfolio grade withheld</b>
-              <p>${unresolved.length} of ${coverage.submitted} positions unresolved: ${esc(list)}</p>
-              <button type="button" data-evaluation-subset="1">Evaluate the ${resolved} resolved
+              <p>${positionErrors.length} of ${coverage.submitted} positions unresolved: ${esc(list)}</p>
+              ${lotBanner}<button type="button" data-evaluation-subset="1">Evaluate the ${resolved} resolved
                 positions as a subset</button></div>`
           : result.status === "subset"
             ? `<div class="evaluation-banner"><b>Subset grade ${esc(result.grade || "–")}</b>
@@ -634,8 +889,9 @@ const Portfolio = (() => {
                 covers ${coverage.scorable} of ${coverage.submitted} positions
                 (${coverage.valued_share === null ? "unknown" : `${fmt(coverage.valued_share, 1)} %`}
                 of resolved value)</p>
-                ${unresolved.length ? `<p class="fineprint">Excluded: ${esc(list)}</p>` : ""}</div>`
-            : "";
+                ${positionErrors.length ? `<p class="fineprint">Excluded: ${esc(list)}</p>` : ""}
+                ${lotBanner}</div>`
+            : lotBanner ? `<div class="evaluation-banner negative"><b>Lot errors</b>${lotBanner}</div>` : "";
       const headline = result.grade === null
         ? `<div class="evaluation-grade"><span>Portfolio grade</span><b>–</b>
             <em>${esc(result.status === "insufficient_data" ? "not evaluated" : "withheld")}</em></div>`
@@ -664,6 +920,8 @@ const Portfolio = (() => {
         <header>${link(card.symbol)}<b class="grade-${esc(card.grade || "none")}">${esc(card.grade || "–")}</b></header>
         <p class="muted">${esc(card.name)}${card.unresolved_reason ? ` — ${esc(card.unresolved_reason)}` : ""}
           ${card.lots > 1 ? `<small>lots: ${card.lots}</small>` : ""}</p>
+        ${(card.lot_errors || []).length
+          ? `<ul class="lot-errors">${lotErrorsHtml(card)}</ul>` : ""}
         <dl>
           <div><dt>${esc(RATING_LABELS.composite)}</dt>
             <dd title="P = partial input set">${esc(compositeText(card.ratings))}</dd></div>
@@ -676,9 +934,13 @@ const Portfolio = (() => {
           <div><dt>Lifecycle</dt><dd>${esc(card.lifecycle_state || "–")}</dd></div>
           <div><dt>Group rank</dt><dd>${fmt(card.group_rank, 0)}</dd></div>
           <div><dt>To stop</dt><dd>${finite(card.distance_to_stop) ? `${fmt(card.distance_to_stop, 1)}%` : "–"}</dd></div>
-          <div><dt>Gain</dt><dd class="${esc(cls(card.gain_pct))}">${esc(signed(card.gain_pct))}</dd></div>
+          <div><dt>Quantity</dt><dd>${fmt(card.valid_quantity, 0)} sh · ${esc(coverageText(card).cost)}</dd></div>
+          <div><dt>Known cost</dt><dd>${money(card.known_cost)}</dd></div>
+          <div><dt>Average cost</dt><dd>${costCell(card)}</dd></div>
+          <div><dt>Gain</dt><dd>${gainCell(card)}</dd></div>
           <div><dt>Weight</dt><dd>${weight(card)}</dd></div>
         </dl>
+        ${stopNote(card) ? `<p class="fineprint">${esc(stopNote(card))}</p>` : ""}
         <p class="evaluation-action ${card.action.state === "hold" ? "positive"
           : card.action.state === "watch" ? "muted" : "negative"}">
           ${esc(card.action.state)} — ${esc(card.action.why)}</p>
@@ -721,10 +983,11 @@ const Portfolio = (() => {
   return {
     contractVersion: PORTFOLIO_CONTRACT_VERSION, GRADE_BANDS, STOCK_WEIGHTS, PORTFOLIO_WEIGHTS,
     STAGE_POINTS, ENTRY_POINTS, CONCENTRATION_LIMIT, GROUP_LIMIT, STOP_LOSS_PCT,
-    NO_EPS_CALENDAR, AI_EVALUATION_LIMIT, RATING_LABELS,
+    NO_EPS_CALENDAR, AI_EVALUATION_LIMIT, RATING_LABELS, LOT_POLICY, COVERAGE_STATES,
     grade, stageNumber, index, sellRules, stopOf, gainPct, distanceToStop, buyRange,
     holdingCard, currentHoldings, sellWatchlist, buyWatchlist, stockScore, action,
-    concentration, evaluate, mergeHoldings, quantityReason, parseHoldings, renderers,
+    concentration, evaluate, validateLots, positionBasis, positions, mergeHoldings,
+    quantityReason, priceReason, coverageText, parseHoldings, renderers,
   };
 })();
 if (typeof module !== "undefined" && module.exports) module.exports = Portfolio;

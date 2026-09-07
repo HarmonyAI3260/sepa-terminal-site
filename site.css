@@ -155,6 +155,16 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .regime-item div span { display: block; margin-top: 2px; color: var(--muted); font-size: .76rem; }
 .regime-item strong { font: 600 1.05rem var(--mono); }
 .regime-item small { grid-column: 2; color: var(--muted); font: .67rem var(--mono); }
+/* SPEC-AI §2: the observation date, staleness, source and hash under each index level. */
+.regime-item .regime-asof, .index-asof { font: .66rem var(--mono); color: var(--muted); }
+.regime-item .regime-asof { word-break: break-word; }
+.index-asof { margin: 4px 0 var(--s2); }
+/* SPEC-AI §1: a lot error is a red line on its own, never a footnote to a number. */
+.lot-errors { margin: 4px 0 0; padding-left: 1.1em; font-size: .72rem; }
+.lot-errors li { margin: 2px 0; }
+/* SPEC-AI §3: a rejected or lagging published resource, named on the surface it feeds. */
+.resource-note { margin-top: var(--s2); font: .7rem var(--mono); color: var(--muted); }
+.resource-note.negative { color: var(--red); }
 .breadth-row { display: grid; grid-template-columns: 82px 1fr 54px; gap: 10px; align-items: center; margin: var(--s3) 0; font: .72rem var(--mono); }
 .leadership { display: grid; grid-template-columns: repeat(6, 1fr); gap: var(--s2); }
 .leader-stat { padding: var(--s3) var(--s2); border: 1px solid var(--border-soft); border-radius: 8px; text-align: center; background: var(--panel-3); }

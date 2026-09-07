@@ -8,6 +8,27 @@ const Screener = (() => {
     accelerating: "sales YoY and PAT YoY both rising over the last three contiguous quarters (AND)",
     code33Lite: "2 of 3 in the latest quarter: EPS YoY ≥20 %, sales YoY ≥20 %, margin ≥ year-ago",
   };
+  /* Named, versioned research templates (SPEC-AI §4.4). ``sepa-v1`` is the policy the
+     published Ready gate applies; ``eps-led-v1`` is a *different* template offered as a
+     preset — it is stricter on EPS and looser on sales, so it selects different names.
+     Both layers are stated, because the preset spans the core screener (growth mode) and
+     the Fundamental filter category (EPS/sales minimums). */
+  const RESEARCH_TEMPLATES = {
+    "sepa-v1": {
+      label: "SEPA policy v1 (PAT-based)",
+      rule: "sales YoY ≥ 20 % and (PAT YoY ≥ 20 % or PAT turnaround); Code 33 (lite) also passes",
+      basis: "latest reported quarter, YoY, consolidated where available",
+    },
+    "eps-led-v1": {
+      label: "EPS-led research (v1)",
+      rule: "core: Code 33 (lite) acceleration · category: EPS YoY ≥ 25 % and sales YoY ≥ 10 %",
+      basis: "latest reported quarter, YoY, diluted EPS; quarter-based figures read unknown "
+        + "unless the financial record is current or lagging",
+    },
+  };
+  /* The category-layer half of a preset: the screener page applies it beside the core
+     state, so a preset can span both layers without either one redefining the other. */
+  const PRESET_CATEGORIES = { "eps-led": { eps_yoy_min: 25, sales_yoy_min: 10 } };
   const filtersVersion = 2;
   // Published identity of this shared filter/verdict/CSV contract. Bump it when a
   // predicate, column or verdict meaning changes; the build manifest records it so a
@@ -53,6 +74,9 @@ const Screener = (() => {
     if (name === "fresh") Object.assign(state, common, { tier: "≥7", rs: 70, recentBreakout: true });
     if (name === "power") Object.assign(state, common, { powerPlay: true });
     if (name === "earnings") Object.assign(state, { tier: "≥7", rs: 70, salesYoy: 20, patYoy: 20 });
+    // EPS-led research (v1): the core half is the Code 33 (lite) acceleration test; the
+    // EPS ≥ 25 % / sales ≥ 10 % half lives in the Fundamental category layer.
+    if (name === "eps-led") Object.assign(state, { tier: "≥7", rs: 70, growthMode: "code33" });
     const toggles = { forming: "forming", "in-base": "inBase", "near-pivot": "nearPivot",
       breakout: "breakout", tightening: "tightening" };
     if (toggles[name]) state[toggles[name]] = true;
@@ -223,7 +247,8 @@ const Screener = (() => {
     return lines.join("\n") + "\n";
   }
   return { readyExplanation, predicateLabels, filtersVersion,
-    contractVersion: SCREENER_CONTRACT_VERSION, defaults, normalize, preset, activePreset, forSnapshot, availability, financialOn, financialVerdict, financialEvaluated, usableFund, coverage,
+    contractVersion: SCREENER_CONTRACT_VERSION, RESEARCH_TEMPLATES, PRESET_CATEGORIES,
+    defaults, normalize, preset, activePreset, forSnapshot, availability, financialOn, financialVerdict, financialEvaluated, usableFund, coverage,
     financialCoverage, coverageText, matches, distance, distanceText, displayedPivot, monthDelta, eventText, legMarkers, description, csvCell, csv };
 })();
 /* Loadable in Node exactly like the other shared modules, so the grouped-filter layer can

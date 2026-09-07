@@ -25,18 +25,40 @@ const REFRESH_OWNER = "sepa_refresh_owner";
 // One atomic build: the page, the screener JSON and every series carry the same
 // build id. A mixed pair is shown, never silently rendered as if it agreed.
 let buildMismatch = null;
+// Every published resource this page rejected or had to limit, named (SPEC-AI §3). The
+// banner lists all of them, not only the first one that was loaded.
+const resourceIssues = [];
 
-function checkBuildId(dataBuildId, priceDate) {
+function resourceIssue(resourceId, detail) {
+  const id = String(resourceId || "a published resource");
+  if (!resourceIssues.some((entry) => entry.id === id)) resourceIssues.push({ id, detail });
+  return resourceIssues;
+}
+
+function renderBuildBanner() {
+  const banner = $("build-mismatch");
+  if (!banner) return;
+  const parts = [];
+  if (buildMismatch) {
+    parts.push((buildMismatch.resource ? `Resource ${buildMismatch.resource} — ` : "")
+      + `Data build ${buildMismatch.data} \u2260 page build ${buildMismatch.page} `
+      + "\u2014 reload to get matching versions."
+      + (buildMismatch.priceDate ? ` The loaded data prices ${buildMismatch.priceDate}.`
+        : " The loaded data has no price date."));
+  }
+  for (const entry of resourceIssues) parts.push(`${entry.id}: ${entry.detail}`);
+  if (!parts.length) { banner.hidden = true; return; }
+  banner.hidden = false;
+  banner.textContent = parts.join(" · ");
+}
+
+function checkBuildId(dataBuildId, priceDate, resourceId) {
   const page = String(document.documentElement.dataset.buildId || "");
   const data = String(dataBuildId || "");
   if (!page || !data || page === data) return false;
-  buildMismatch = { data, page, priceDate: priceDate || null };
-  const banner = $("build-mismatch");
-  if (banner) {
-    banner.hidden = false;
-    banner.textContent = `Data build ${data} \u2260 page build ${page} \u2014 reload to get matching versions.`
-      + (priceDate ? ` The loaded data prices ${priceDate}.` : " The loaded data has no price date.");
-  }
+  buildMismatch = { data, page, priceDate: priceDate || null, resource: resourceId || null };
+  if (resourceId) resourceIssue(resourceId, `from build ${data}, not ${page}`);
+  renderBuildBanner();
   for (const id of ["scan-export-tv", "scan-export-csv"]) {
     const control = $(id);
     if (control) {
@@ -172,8 +194,26 @@ function applyPreset(name) {
   turnoverWasSaved = name !== "reset" || scanData !== null;
   filters = Screener.preset(name, scanData?.meta || {});
   saveFilters();
+  // SPEC-AI §4.4: a named template can span both layers. The category half of such a
+  // preset is applied with the core half (additively — no other saved condition is
+  // touched), so what the page shows is exactly what it filtered on.
+  const categoryHalf = Screener.PRESET_CATEGORIES[name];
+  if (categoryHalf) {
+    categories = ScreenFilters.normalize({ ...categories, ...categoryHalf });
+    saveCategories();
+    renderCategoryControls();
+  }
   renderFilterControls();
   renderRows();
+}
+
+/* The research template the current state matches, if any: named on the coverage line so
+   a screen's meaning is never implied by its counts alone. */
+function activeTemplate() {
+  const half = Screener.PRESET_CATEGORIES["eps-led"];
+  const matches = Object.entries(half).every(([key, value]) => categories[key] === value);
+  if (matches && filters.growthMode === "code33") return Screener.RESEARCH_TEMPLATES["eps-led-v1"];
+  return null;
 }
 
 function sortValue(row, key) {
@@ -278,7 +318,11 @@ function renderCoverage() {
   }
   $("scan-coverage").textContent = `RS-line NH: ${coverage.rsKnown} known / ${coverage.total} (${coverage.rsUsable} current) · RS Δ1m ${Screener.monthDelta({}, scanData?.meta || {})}`;
   const categoryLine = $("category-coverage");
-  if (categoryLine) categoryLine.textContent = ScreenFilters.coverageText(scanData?.rows || [], categories, scanData);
+  if (categoryLine) {
+    const template = activeTemplate();
+    categoryLine.textContent = ScreenFilters.coverageText(scanData?.rows || [], categories, scanData)
+      + (template ? ` · ${template.label}: ${template.rule} (${template.basis})` : "");
+  }
 }
 
 function renderRows(resetPage = true) {
@@ -445,7 +489,13 @@ function loadScreener() {
       const data = await response.json();
       if (!Array.isArray(data?.rows)) throw new Error("Snapshot has no row list");
       scanData = data;
-      checkBuildId(data?.meta?.build_id, data?.meta?.as_of);
+      // The screener payload is a published resource like any other: its envelope is
+      // checked, and a rejected one is named in the banner (SPEC-AI §3).
+      const check = Resources.validate(data, { kind: "screener", buildId: pageBuildId(),
+        asOf: data?.meta?.as_of, manifest: pageManifest });
+      if (!check.ok) resourceIssue((check.envelope || {}).id || "screener", check.reason);
+      checkBuildId(data?.meta?.build_id, data?.meta?.as_of,
+        (check.envelope || {}).id || "screener");
       filters = Screener.forSnapshot(filters, scanData);
       saveFilters();
       if (!turnoverWasSaved) {
@@ -536,6 +586,42 @@ async function fetchJson(path) {
   return response.json();
 }
 
+/* ── one typed loader for every published resource (SPEC-AI §3) ─────────────
+   ``fetchJson`` + ``Resources.validate``: the caller gets the payload and a verdict
+   ("current", "compatible", "lagging", "stale", "foreign", "missing", "conflicted") and
+   decides whether to render, to fall back, or to show the resource notice. Nothing is
+   rendered as current on the strength of a build stamp alone. */
+let manifestPromise = null;
+let pageManifest = null;
+
+async function loadManifest(path = "/data/manifest.json") {
+  if (pageManifest) return pageManifest;
+  if (!manifestPromise) {
+    manifestPromise = fetchJson(path).then((payload) => { pageManifest = payload; return payload; })
+      .catch(() => { pageManifest = {}; return pageManifest; });
+  }
+  return manifestPromise;
+}
+
+async function loadResource(path, expectation = {}) {
+  const payload = await fetchJson(path);
+  const manifest = expectation.manifest !== undefined ? expectation.manifest
+    : await loadManifest(expectation.manifestPath || "/data/manifest.json");
+  const check = Resources.validate(payload, {
+    buildId: pageBuildId(),
+    asOf: expectation.asOf,
+    kind: expectation.kind,
+    instrument: expectation.instrument,
+    manifest,
+  });
+  const id = (check.envelope || {}).id || expectation.kind || path;
+  if (!check.ok) {
+    resourceIssue(id, check.reason);
+    renderBuildBanner();
+  }
+  return { payload, check, id };
+}
+
 function pageBuildId() {
   return String((document.documentElement.dataset || {}).buildId || "");
 }
@@ -552,7 +638,10 @@ let routesPromise = null;
 async function loadRoutes(path = "/data/routes.json") {
   if (routePages) return routePages;
   if (!routesPromise) {
-    routesPromise = fetchJson(path).then((payload) => {
+    routesPromise = loadResource(path, { kind: "routes" }).then(({ payload, check }) => {
+      // A route map from another build points into destinations this build may not have
+      // written: it is reported and dropped rather than used to resolve links.
+      if (!check.ok) { routePages = {}; return routePages; }
       const map = {};
       for (const symbol of payload.full || []) map[String(symbol)] = "full";
       for (const symbol of payload.technical || []) map[String(symbol)] = "technical";
@@ -615,7 +704,15 @@ async function loadListContext(symbol) {
       error: `${requested.id} is not a list in this browser` };
   }
   try {
-    const payload = await fetchJson(`/data/lists/${requested.id}.json`);
+    const { payload, check } = await loadResource(`/data/lists/${requested.id}.json`,
+      { kind: "list" });
+    if (!check.ok) {
+      // A list from another build carries another order: the reader gets no context
+      // rather than a next/previous walk through a stale sequence.
+      return { version: MSChart.LIST_CONTEXT_VERSION, id: null, title: null, symbols: [],
+        index: -1, position: null, sort: null, pages: null, unresolved: [], fallback: true,
+        error: Resources.describe(check) };
+    }
     const rows = payload.rows || [];
     const present = new Set(rows.map((row) => String(row.symbol)));
     const pages = {};
@@ -829,11 +926,23 @@ async function initChart(config, context, mount = {}) {
   let seriesReference = null;
   let indexCloses = new Map();
   let rsCloses = new Map();
+  // Every resource this chart loaded, with the verdict that decided how it was used.
+  const resourceNotes = [];
+  let weeklyFallback = null;
   try {
-    const series = await fetchJson(config.seriesPath);
+    const { payload: series, check, id } = await loadResource(config.seriesPath,
+      { kind: "series", instrument: symbol, asOf: config.as_of });
     daily = Array.isArray(series) ? series : series.bars || [];
     seriesReference = Array.isArray(series) ? null : series.reference || null;
-    checkBuildId(series.build_id, daily.length ? daily[daily.length - 1][0] : null);
+    checkBuildId(series.build_id, daily.length ? daily[daily.length - 1][0] : null, id);
+    if (!check.ok) {
+      // The daily history is the chart: an incompatible one is blocked, never mixed
+      // with this build's pattern, stop and risk band.
+      container.innerHTML = '<div class="chart-loading negative">The chart is blocked: '
+        + `${esc(Resources.describe(check))}. Reload for matching versions.</div>`;
+      return;
+    }
+    if (Resources.badge(check)) resourceNotes.push(`price history ${Resources.badge(check)}`);
     if (series.note) {
       const note = document.createElement("p");
       note.className = "fineprint"; note.textContent = series.note;
@@ -845,8 +954,19 @@ async function initChart(config, context, mount = {}) {
   }
   if (config.weeklyPath) {
     try {
-      const payload = await fetchJson(config.weeklyPath);
-      weekly = payload.bars || [];
+      const { payload, check, id } = await loadResource(config.weeklyPath,
+        { kind: "weekly", instrument: symbol, asOf: config.as_of });
+      if (check.ok) {
+        weekly = payload.bars || [];
+        if (Resources.badge(check)) resourceNotes.push(`weekly history ${Resources.badge(check)}`);
+      } else {
+        // Not blocked: the weekly view is aggregated from the daily history this build
+        // published, and the page says the stored file was rejected.
+        weekly = MSChart.aggregate(daily, "W");
+        weeklyFallback = `${id} was rejected (${check.reason}); the weekly view is `
+          + "aggregated from this build's daily history instead";
+        resourceNotes.push(weeklyFallback);
+      }
     } catch { weekly = MSChart.aggregate(daily, "W"); }
   } else {
     weekly = MSChart.aggregate(daily, "W");
@@ -854,13 +974,28 @@ async function initChart(config, context, mount = {}) {
   for (const [path, target] of [[config.indexPath, "index"], [config.rsIndexPath, "rs"]]) {
     if (!path) continue;
     try {
-      const payload = await fetchJson(path);
+      const instrument = String(path).split("/").pop().replace(/\.json$/, "");
+      const { payload, check, id } = await loadResource(path,
+        { kind: "index", instrument, asOf: config.as_of });
+      if (!check.ok) {
+        // A benchmark that cannot be trusted is not drawn at all: an overlay or an RS
+        // line from another build beside a current pattern is exactly the mix the
+        // sixth audit found.
+        resourceNotes.push(`${target === "index" ? "index overlay" : "RS line"} hidden — `
+          + `${Resources.describe(check)}`);
+        continue;
+      }
       const pairs = payload.closes && payload.closes.length
         ? payload.closes : (payload.bars || []).map((bar) => [bar[0], bar[4]]);
       const map = new Map(pairs.map(([day, value]) => [String(day), Number(value)]));
       if (target === "index") indexCloses = map; else rsCloses = map;
+      const observed = (check.envelope || {}).observed_through;
+      const badge = Resources.badge(check);
+      resourceNotes.push(`${id} last ${observed}${badge ? ` · ${badge}` : ""}`);
     } catch { /* an unpublished index simply has no overlay */ }
   }
+  const benchmarkNote = $("chart-benchmarks");
+  if (benchmarkNote) benchmarkNote.textContent = resourceNotes.join(" · ");
 
   if (!daily.length) {
     container.innerHTML = '<div class="chart-loading muted">Price series missing from this snapshot.</div>';
@@ -1014,6 +1149,7 @@ async function initChart(config, context, mount = {}) {
         ? `loaded-range high ₹${fmt(loaded.high, 2)} · loaded-range low ₹${fmt(loaded.low, 2)} (${loaded.bars} ${timeframe} bars)`
         : null,
       MSChart.partialLastNote(daily, timeframe, config.as_of || priceReference.asOf),
+      timeframe === "W" && weeklyFallback ? weeklyFallback : null,
     ].filter(Boolean).join(" · "));
     setFineprint("panel-reference-window", priceReference.available
       ? `${priceReference.window || "window unknown"} · ${priceReference.status}`
@@ -1303,14 +1439,32 @@ async function initTechnical() {
   if (heading) heading.textContent = requested;
 
   let stock = null;
+  let stockCheck = null;
+  let stockResourceId = `stock/${requested}`;
   try {
-    stock = await fetchJson(`${config.stockPath || "/data/stock/"}${encodeURIComponent(requested)}.json`);
+    const loaded = await loadResource(
+      `${config.stockPath || "/data/stock/"}${encodeURIComponent(requested)}.json`,
+      { kind: "stock", instrument: requested, asOf: config.as_of });
+    stock = loaded.payload;
+    stockCheck = loaded.check;
+    stockResourceId = loaded.id;
   } catch {
     if (hero) hero.innerHTML = technicalNotFound(requested, config.as_of);
     for (const id of ["chart-card", "technical-financials", "technical-pattern", "technical-lists"]) hide($(id));
     return;
   }
-  checkBuildId(stock.build_id, stock.last_date || config.as_of);
+  checkBuildId(stock.build_id, stock.last_date || config.as_of, stockResourceId);
+  if (stockCheck && !stockCheck.ok) {
+    // The row this page renders (pattern, stop, ratings) is the resource: an
+    // incompatible one is reported instead of being drawn as current.
+    if (hero) {
+      hero.innerHTML = `<h1>${esc(requested)}</h1><p class="list-empty negative">`
+        + `${esc(Resources.describe(stockCheck))}. Reload for matching versions.</p>`;
+    }
+    for (const id of ["chart-card", "technical-financials", "technical-pattern",
+      "technical-lists"]) hide($(id));
+    return;
+  }
   const symbol = String(stock.symbol || requested);
   const ratings = stock.ratings || {};
   const group = stock.group || {};
@@ -1477,8 +1631,15 @@ async function initList() {
   let payload;
   try {
     const config = JSON.parse(configNode.textContent);
-    payload = await fetchJson(config.path);
-    checkBuildId(payload.build_id, payload.as_of);
+    const loaded = await loadResource(config.path, { kind: "list", asOf: config.as_of });
+    payload = loaded.payload;
+    checkBuildId(payload.build_id, payload.as_of, loaded.id);
+    if (!loaded.check.ok) {
+      target.insertAdjacentHTML("afterbegin",
+        `<p class="fineprint negative">${esc(Resources.describe(loaded.check))}; the table `
+        + "above is this build's published snapshot and the live controls are disabled.</p>");
+      return;
+    }
   } catch (error) {
     target.insertAdjacentHTML("afterbegin",
       `<p class="fineprint negative">Live list data could not be loaded (${esc(error.message)}); the table above is the published snapshot.</p>`);
@@ -1829,8 +1990,15 @@ async function initUserPage() {
   host.innerHTML = '<p class="list-empty">Loading the published snapshot…</p>';
   let rows = [];
   try {
-    const payload = await fetchJson(config.screenerPath || "/data/screener.json");
-    checkBuildId(payload.build_id || payload.meta?.build_id, payload.meta?.as_of);
+    const loaded = await loadResource(config.screenerPath || "/data/screener.json",
+      { kind: "screener", asOf: config.as_of });
+    const payload = loaded.payload;
+    checkBuildId(payload.build_id || payload.meta?.build_id, payload.meta?.as_of, loaded.id);
+    if (!loaded.check.ok) {
+      host.innerHTML = `<p class="list-empty negative">${esc(Resources.describe(loaded.check))}, `
+        + "so nothing here can be valued against it. Reload for matching versions.</p>";
+      return;
+    }
     rows = payload.rows || [];
   } catch (error) {
     host.innerHTML = `<p class="list-empty negative">The published snapshot could not be loaded (${esc(error.message)}), so nothing can be valued.</p>`;
@@ -1865,7 +2033,14 @@ async function initUserPage() {
       lastHoldings = holdings || [];
       const result = Portfolio.evaluate(holdings, byId, { asOf: config.as_of, ...options });
       host.innerHTML = portfolioView.evaluation(result);
-      if (status) status.textContent = note || "";
+      // SPEC-AI §1: a lot error is reported on the status line even when the portfolio
+      // evaluates — an invalid line never disappears because another lot was valid.
+      const lotErrors = (result.coverage.unresolved || []).filter((entry) => entry.kind === "lot");
+      const lotNote = lotErrors.length
+        ? ` ${lotErrors.length} lot error(s): ${lotErrors.map((entry) => `${entry.symbol}`
+          + `${entry.line === null ? "" : ` line ${entry.line}`}: ${entry.reason}`).join("; ")}.`
+        : "";
+      if (status) status.textContent = `${note || ""}${lotNote}`;
       // The subset run is always the reader's explicit choice: a withheld grade never
       // turns itself into a partial one.
       if (subsetButton) {
