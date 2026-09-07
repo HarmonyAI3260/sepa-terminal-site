@@ -537,8 +537,12 @@ input.blocked { outline: 2px solid #c78b35; outline-offset: 2px; }
    with the space bar (and the browser's own full-screen state survives, because the
    page is never reloaded). */
 body[data-page="chartview"] { overflow: hidden; }
-.chartview { display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; gap: var(--s2);
+.chartview { display: grid; grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr) auto; gap: var(--s2);
   height: 100vh; height: 100dvh; padding: var(--s2) var(--s3); }
+/* The implicit auto column sized itself to the chart's min-content at 375 px (457 px wide);
+   one explicit minmax(0,1fr) column keeps every row inside the viewport. */
+.chartview > * { min-width: 0; }
 .chartview-head { display: flex; flex-wrap: wrap; gap: var(--s3); align-items: flex-start;
   justify-content: space-between; border-bottom: 1px solid var(--border-soft);
   padding-bottom: var(--s2); }

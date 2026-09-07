@@ -6,8 +6,12 @@ const CACHE_PREFIX = `sepa-terminal:${encodeURIComponent(SCOPE.pathname)}:`;
 // One cache per build id: a snapshot cached by an earlier build can never be served
 // beside this build's pages, whatever the app-shell digest says.
 const BUILD_ID = "06901d984504";
+// The stamp every page puts on its shell asset URLs: the build id plus a digest of the
+// assets themselves, so a rebuild with different code under the same snapshot still
+// changes every URL and this worker never serves the previous JavaScript to it.
+const ASSET_VERSION = "06901d98-9753c832c1";
 const BUILD_PREFIX = `${CACHE_PREFIX}${BUILD_ID}:`;
-const CACHE_NAME = BUILD_PREFIX + "ee116e9ad52b-55988ef4c7bc";
+const CACHE_NAME = BUILD_PREFIX + "ee116e9ad52b-b9549c2c2b30";
 const APP_SHELL = ["./", "index.html", "site.css", "site.js", "screener.js", "mschart.js", "lists.js", "mylists.js", "portfolio.js", "screenfilters.js", "resources.js", "manifest.webmanifest", "s/index.html", "chart/index.html", "vendor/lightweight-charts.standalone.production.js", "privacy.html", "offline.html", "404.html", "icons/icon-192.png", "icons/icon-512.png", "icons/maskable-192.png", "icons/maskable-512.png", "icons/apple-touch-icon.png", "icons/feature-graphic.png"];
 const SHELL_URLS = new Set(APP_SHELL.map(path => new URL(path, SCOPE).href));
 const OFFLINE_URL = new URL("offline.html", SCOPE).href;
@@ -103,12 +107,13 @@ self.addEventListener("fetch", event => {
   if (navigation || snapshot) {
     event.respondWith(networkFirst(request, key, !url.search && (snapshot || shell), navigation));
   } else if (shell) {
-    // Shell assets are stamped ?v=<build id>. This build's own stamp names exactly the
-    // file that was precached, so it is served from the cache; any other stamp belongs to
-    // another build's page and must go to the network first, using the cache only when
-    // offline. An unstamped request keeps the original cache-first behaviour.
+    // Shell assets are stamped ?v=<build id>-<asset digest>. This worker's own stamp names
+    // exactly the files it precached, so they are served from the cache; any other stamp
+    // belongs to another build (or another code revision of this build) and must go to
+    // the network first, using the cache only when offline. An unstamped request keeps
+    // the original cache-first behaviour.
     const stamp = url.searchParams.get("v");
-    if (!url.search || stamp === BUILD_ID) event.respondWith(cacheFirst(request, key));
+    if (!url.search || stamp === ASSET_VERSION) event.respondWith(cacheFirst(request, key));
     else event.respondWith(networkFirst(request, key, false, false));
   }
 });
