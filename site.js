@@ -2952,6 +2952,55 @@ function initTheme() {
   });
 }
 
+/* ── §7b the collapsed drawers (SPEC-AL §1.5/§2) ───────────────────────────────
+   Nothing is removed from a page: the evidence blocks are behind three <details>.
+   Each remembers whether the reader left it open, and a hash that points inside a
+   closed one opens it first, so every deep link the audits use still lands. */
+const DETAILS_MEMORY = [
+  ["technical-details", "sepa_technical_open"],
+  ["chart-notes", "sepa_chart_notes_open"],
+  ["provenance", "sepa_provenance_open"],
+];
+
+function rememberDetails(element, key) {
+  let saved = null;
+  try { saved = localStorage.getItem(key); } catch { saved = null; }
+  if (saved === "1" || saved === "0") element.open = saved === "1";
+  element.addEventListener("toggle", () => {
+    try { localStorage.setItem(key, element.open ? "1" : "0"); } catch { /* private mode */ }
+  });
+}
+
+/* A link to #definitions, #tt-card or #chart-notes must open what encloses it — a
+   browser will not scroll to a target inside a closed <details>. */
+function openDetailsForHash() {
+  const raw = String((window.location || {}).hash || "").replace(/^#/, "");
+  if (!raw) return null;
+  let id = raw;
+  try { id = decodeURIComponent(raw); } catch { id = raw; }
+  const target = document.getElementById(id);
+  if (!target) return null;
+  let node = typeof target.closest === "function" ? target.closest("details") : null;
+  let outermost = null;
+  while (node) {
+    node.open = true;
+    outermost = node;
+    const parent = node.parentElement;
+    node = parent && typeof parent.closest === "function" ? parent.closest("details") : null;
+  }
+  if (outermost) target.scrollIntoView?.({ block: "start" });
+  return outermost;
+}
+
+function initDetailsMemory() {
+  for (const [id, key] of DETAILS_MEMORY) {
+    const element = $(id);
+    if (element) rememberDetails(element, key);
+  }
+  openDetailsForHash();
+  window.addEventListener("hashchange", openDetailsForHash);
+}
+
 function toggleKeyHelp(open) {
   const overlay = $("key-help");
   if (!overlay) return;
@@ -2978,6 +3027,7 @@ initNavigation();
 initSidebar();
 initTheme();
 initKeyHelp();
+initDetailsMemory();
 renderSidebarCounts();
 if (document.body.dataset.page === "screener") initScreener();
 if (document.body.dataset.page === "stock") initStock();

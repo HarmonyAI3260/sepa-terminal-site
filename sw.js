@@ -9,9 +9,9 @@ const BUILD_ID = "06901d984504";
 // The stamp every page puts on its shell asset URLs: the build id plus a digest of the
 // assets themselves, so a rebuild with different code under the same snapshot still
 // changes every URL and this worker never serves the previous JavaScript to it.
-const ASSET_VERSION = "06901d98-9753c832c1";
+const ASSET_VERSION = "06901d98-a964352433";
 const BUILD_PREFIX = `${CACHE_PREFIX}${BUILD_ID}:`;
-const CACHE_NAME = BUILD_PREFIX + "ee116e9ad52b-b9549c2c2b30";
+const CACHE_NAME = BUILD_PREFIX + "ee116e9ad52b-17b3bc604437";
 const APP_SHELL = ["./", "index.html", "site.css", "site.js", "screener.js", "mschart.js", "lists.js", "mylists.js", "portfolio.js", "screenfilters.js", "resources.js", "manifest.webmanifest", "s/index.html", "chart/index.html", "vendor/lightweight-charts.standalone.production.js", "privacy.html", "offline.html", "404.html", "icons/icon-192.png", "icons/icon-512.png", "icons/maskable-192.png", "icons/maskable-512.png", "icons/apple-touch-icon.png", "icons/feature-graphic.png"];
 const SHELL_URLS = new Set(APP_SHELL.map(path => new URL(path, SCOPE).href));
 const OFFLINE_URL = new URL("offline.html", SCOPE).href;
