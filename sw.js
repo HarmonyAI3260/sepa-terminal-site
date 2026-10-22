@@ -5,13 +5,13 @@ const SCOPE = new URL(self.registration.scope);
 const CACHE_PREFIX = `sepa-terminal:${encodeURIComponent(SCOPE.pathname)}:`;
 // One cache per build id: a snapshot cached by an earlier build can never be served
 // beside this build's pages, whatever the app-shell digest says.
-const BUILD_ID = "1c4bd66eb59d";
+const BUILD_ID = "5a6757e641b3";
 // The stamp every page puts on its shell asset URLs: the build id plus a digest of the
 // assets themselves, so a rebuild with different code under the same snapshot still
 // changes every URL and this worker never serves the previous JavaScript to it.
-const ASSET_VERSION = "1c4bd66e-a964352433";
+const ASSET_VERSION = "5a6757e6-a964352433";
 const BUILD_PREFIX = `${CACHE_PREFIX}${BUILD_ID}:`;
-const CACHE_NAME = BUILD_PREFIX + "7c96e27a26fe-eda14ea9bb27";
+const CACHE_NAME = BUILD_PREFIX + "aa5aa68e6b0c-620aecf11c9f";
 const APP_SHELL = ["./", "index.html", "site.css", "site.js", "screener.js", "mschart.js", "lists.js", "mylists.js", "portfolio.js", "screenfilters.js", "resources.js", "manifest.webmanifest", "s/index.html", "chart/index.html", "vendor/lightweight-charts.standalone.production.js", "privacy.html", "offline.html", "404.html", "icons/icon-192.png", "icons/icon-512.png", "icons/maskable-192.png", "icons/maskable-512.png", "icons/apple-touch-icon.png", "icons/feature-graphic.png"];
 const SHELL_URLS = new Set(APP_SHELL.map(path => new URL(path, SCOPE).href));
 const OFFLINE_URL = new URL("offline.html", SCOPE).href;
